@@ -1,2 +1,1 @@
-"# BanditBLE" 
-"# BanditBLE_NRF52" 
+# BanditBLE_NRF52
