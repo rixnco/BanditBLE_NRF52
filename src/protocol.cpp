@@ -5,6 +5,7 @@
 // Serial Protocol definition
 #define PROTO_QUERY_REQ    '?'
 #define PROTO_PARAM_REQ    '$'
+#define PROTO_OVERRIDE_REQ '!'
 
 
 // Configuration parameters ID
@@ -46,6 +47,8 @@ static bool setParam(int p, char* ptr);
 static bool processQueryRequest();
 static void sendReport();
 
+static bool processOverrideRequest();
+
 
 void processInput()
 {
@@ -53,6 +56,7 @@ void processInput()
 
   if(_reportPeriod>0 && now-_lastReport>_reportPeriod) 
   {
+    _lastReport=now;
     sendReport();
   }
 
@@ -72,6 +76,10 @@ void processInput()
       case PROTO_QUERY_REQ:
         if(!processQueryRequest()) sendError("Invalid query request");
         else sendAck();  
+        break;
+      case PROTO_OVERRIDE_REQ:
+        if(!processOverrideRequest()) sendError("Invalid override request");
+        // else sendAck();  
         break;
       default:
         sendError("Unknown command");
@@ -114,8 +122,11 @@ static bool processParamRequest()
   switch(*ptr) {
    case '$':
     ++ptr;
-    if(*ptr==0) sendSettings();
-    return true;
+    if(*ptr==0) {
+      sendSettings();
+      return true;
+    } 
+    return false;
     break;
    case '<':
     // Store settings.
@@ -256,15 +267,46 @@ static bool processQueryRequest() {
   return true;
 }
 
+static bool processOverrideRequest() {
+  char* ptr= &inBuffer[1];
+  unsigned long  ul;
+  uint16_t rpm;
+  uint8_t gear;
+
+  switch(*ptr) {
+   case '!':
+    ++ptr;
+    if(*ptr!=0) return false;
+    setOverride(false, 0, 0);
+    break;
+  default:
+    ul= strtoul(ptr, &ptr, 10);
+    if(*ptr++!=',') return false;
+    gear = ul;
+    ul= strtoul(ptr, &ptr, 10);
+    if(*ptr!=0) return false;
+    rpm = ul;
+
+    setOverride(true, rpm, gear);
+
+  }
+
+  return true;
+}
+
+
+extern uint8_t currentGear;
+extern uint16_t currentRPM;
+
 
 static void sendReport() 
 {
-  int rpm, rawGear;
-  rpm = 0;//g_rpm;
-  rawGear = 0; //g_rawGear;
+  int rpm, gear;
+  rpm = currentRPM;
+  gear = currentGear;
   
-  Serial.print(">"); Serial.print(rpm); 
-  Serial.print(","); Serial.print(rawGear);
+  Serial.print(">"); Serial.print(gear);
+  Serial.print(","); Serial.print(rpm); 
   Serial.println();
 }
 

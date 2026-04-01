@@ -1,42 +1,56 @@
 #include <Arduino.h>
 #include <bluefruit.h>
+#include "LSM6DS3.h"
+#include "Wire.h"
 
-#include <Wire.h>
 #include <I2Cdev.h>
 #include <MPU6050_6Axis_MotionApps20.h>
+
 #include "settings.h"
 #include "protocol.h"
 
-#define SERIAL1_RX PIN_SERIAL1_RX
-#define SERIAL1_TX PIN_SERIAL1_TX
+#include <SPI.h>
 
-#define DEBUG
+#include "SdFat.h"
+#include <Adafruit_SPIFlash.h>
 
-#ifdef DEBUG
-#define dbg_print(...) Serial.print(__VA_ARGS__)
-#define dbg_printf(...) Serial.printf(__VA_ARGS__)
-#define dbg_println(...) Serial.println(__VA_ARGS__)
-#else
-#define dbg_print(...) \
-  do                   \
-  {                    \
-  } while (0)
-#define dbg_printf(...) \
-  do                   \
-  {                    \
-  } while (0)
-#define dbg_println(...) \
-  do                     \
-  {                      \
-  } while (0)
-#endif
+// for flashTransport definition
+#include "flash_config.h"
+
+
+// Flash Chip declerations, made up from Data Sheets.
+//  https://files.seeedstudio.com/wiki/github_weiruanexample/Flash_P25Q16H-UXH-IR_Datasheet.pdf
+SPIFlash_Device_t const p25q16h{
+  .total_size = (1UL << 21),  // 2MiB
+  .start_up_time_us = 10000,
+  .manufacturer_id = 0x85,
+  .memory_type = 0x60,
+  .capacity = 0x15,
+  .max_clock_speed_mhz = 55,
+  .quad_enable_bit_mask = 0x02,
+  .has_sector_protection = 1,
+  .supports_fast_read = 1,
+  .supports_qspi = 1,
+  .supports_qspi_writes = 1,
+  .write_status_register_split = 1,
+  .single_status_byte = 0,
+  .is_fram = 0,
+};
+
+
+
+
+
+Adafruit_SPIFlash flash(&flashTransport);
+
+
 
 #define TACH_INT_PIN 2
 #define REFRESH_RATE 100 // milliseconds between sensor updates
 #define DEBOUNCE_TIME (3 * REFRESH_RATE)
 
 #define LED_ON LED_STATE_ON
-#define LED_OFF LED_STATE_OFF
+#define LED_OFF !LED_STATE_ON
 
 #define LED_PIN LED_RED
 
@@ -60,6 +74,7 @@ static void connect_callback(uint16_t conn_handle);
 static void startAdv(void);
 
 uint8_t currentGear = -1;
+uint16_t currentRPM = 0;
 
 static uint16_t getRPM();
 static uint8_t readGEAR();
@@ -73,132 +88,94 @@ volatile uint32_t _size;
 
 #define IMU_INT_PIN     7
 
-static MPU6050 mpu;
-static bool dmpReady = false;  // set true if DMP init was successful
-static uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
-static uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
-static uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
-static uint8_t fifoBuffer[64]; // FIFO storage buffer
+volatile bool _override = false;
+volatile int _overrideRPM = 0;
+volatile int _overrideGear = 0;
 
 
-volatile static bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
-void dmpDataReady() {
-    mpuInterrupt = true;
+//Create a instance of class LSM6DS3
+LSM6DS3 myIMU(I2C_MODE, 0x6A);    //I2C device address 0x6A
+
+
+void setOverride(bool override, int rpm, int gear) {
+  _override = override;
+  _overrideRPM = rpm;
+  _overrideGear = gear;
+  digitalWrite(LED_RED, _override?LED_ON:LED_OFF);
 }
+
 
 
 //The setup function is called once at startup of the sketch
 void setup()
 {
-  pinMode(PIN_LED1, OUTPUT_H0D1);
-  pinMode(PIN_LED2, OUTPUT_H0D1);
-  pinMode(PIN_LED3, OUTPUT_H0D1);
-  pinMode(PIN_LED4, OUTPUT_H0D1);
-  digitalWrite(PIN_LED1, LED_OFF);    // Weak LED (HS?)
-  digitalWrite(PIN_LED2, LED_OFF);    // OK
-  digitalWrite(PIN_LED3, LED_OFF);    // HS
-  digitalWrite(PIN_LED4, LED_OFF);    // HS
 
-
-
-#ifdef USE_TINYUSB
-  // EBO: Call it here instead of main.cpp
-  TinyUSB_Device_Init(0);
-#endif
-
-#if CFG_DEBUG
-  // EBO:  Call it here instead of main.cpp
-  // // If Serial is not begin(), call it to avoid hard fault
-  if(!Serial) Serial.begin(115200);
-#endif
-
-
-#ifdef DEBUG
-  // Serial.setPins(SERIAL1_RX, SERIAL1_TX);
   Serial.begin(115200);
   uint32_t idx=50;
   bool state = true;
-  while(!Serial) {
+  uint32_t now = millis();
+  while(!Serial && millis()-now<5000) {
     yield();
     delay(10);
     if(--idx == 0) { 
-      digitalWrite(PIN_LED1, state? LED_ON : LED_OFF );
+      digitalWrite(LED_GREEN, state? LED_ON : LED_OFF );
       idx=50;
       state = !state;
     }
   }
-  digitalWrite(PIN_LED1, LED_ON);
-#endif
+  digitalWrite(LED_GREEN, Serial?LED_ON:LED_OFF);
+  digitalWrite(LED_RED, _override?LED_ON:LED_OFF);
 
-  dbg_println("#Starting");
+  Serial.println("#Starting");
 
-  dbg_println("#Read settings");
+  Serial.println("#Read settings");
   if (!readSettings())
   {
-    dbg_println("#Default settings");
+    Serial.println("#Default settings");
     resetSettings();
-    dbg_println("#Write settings");
+    Serial.println("#Write settings");
     writeSettings();
   }
-  dbg_print("$GEAR1=");
-  dbg_println(g_settings.gear1);
-  dbg_print("$GEAR2=");
-  dbg_println(g_settings.gear2);
-  dbg_print("$GEAR3=");
-  dbg_println(g_settings.gear3);
-  dbg_print("$GEAR4=");
-  dbg_println(g_settings.gear4);
-  dbg_print("$GEAR5=");
-  dbg_println(g_settings.gear5);
-  dbg_print("$GEAR6=");
-  dbg_println(g_settings.gear6);
+  Serial.print("$GEAR1=");
+  Serial.println(g_settings.gear1);
+  Serial.print("$GEAR2=");
+  Serial.println(g_settings.gear2);
+  Serial.print("$GEAR3=");
+  Serial.println(g_settings.gear3);
+  Serial.print("$GEAR4=");
+  Serial.println(g_settings.gear4);
+  Serial.print("$GEAR5=");
+  Serial.println(g_settings.gear5);
+  Serial.print("$GEAR6=");
+  Serial.println(g_settings.gear6);
 
 
   Wire.begin();
   Wire.setClock(400000);
 
-  mpu.initialize();
-
-  devStatus = mpu.dmpInitialize() ;
-  mpu.setXGyroOffset(-7);
-  mpu.setYGyroOffset(-60);
-  mpu.setZGyroOffset(2);
-  mpu.setXAccelOffset(-4640); 
-  mpu.setYAccelOffset(-531); 
-  mpu.setZAccelOffset(1044); 
-
-  if (devStatus == 0)
-  {
-   dbg_println("IMU...OK");
-
-        //Calibration Time: generate offsets and calibrate our MPU6050
-        mpu.CalibrateAccel(12);
-        mpu.CalibrateGyro(12);
-#ifdef DEBUG
-        mpu.PrintActiveOffsets();
-#endif
-        mpu.setInterruptMode(0);
-        mpu.setInterruptDrive(0);
-        mpu.setInterruptLatch(1);
-        mpu.setInterruptLatchClear(0);
-        mpu.setIntDMPEnabled(true);
-
-        pinMode(IMU_INT_PIN, INPUT);
-        // We need to modify WInterrupts.c in order to change GPIOTE IRQ level from 2 to 3.
-        // IRQ Level 2 is reserved for softdevice
-        attachInterrupt(digitalPinToInterrupt(IMU_INT_PIN), dmpDataReady, RISING);
-
-        // get expected DMP packet size for later comparison
-        packetSize = mpu.dmpGetFIFOPacketSize();
-
-      //   // set our DMP Ready flag so the main loop() function knows it's okay to use it
-      //  Serial.println("DMP ready! Waiting for first interrupt...");
-        dmpReady = true;
-
+  if (myIMU.begin() != 0) {
+      Serial.println("myIMU error");
+  } else {
+      Serial.println("myIMU OK!");
   }
-  else
-  {
-     dbg_println("IMU...KO");
+
+
+  Serial.println("Adafruit Serial Flash Info example");
+  if(flash.begin(&p25q16h, 1)) {
+
+    // Using a flash device not already listed? Start the flash memory by passing
+    // it the array of device settings defined above, and the number of elements
+    // in the array.
+    // flash.begin(my_flash_devices, flashDevices);
+
+    uint32_t jedec_id = flash.getJEDECID();
+    Serial.print("JEDEC ID: 0x");
+    Serial.println(jedec_id, HEX);
+    Serial.print("Flash size (usable): ");
+    Serial.print(flash.size() / 1024);
+    Serial.println(" KB");
+  } else {
+    Serial.println("Flash...KO");
   }
 
   // Configure INPUT pin
@@ -226,12 +203,12 @@ void setup()
   // Enable PPI channel 0
   NRF_PPI->CHEN = (PPI_CHEN_CH0_Enabled << PPI_CHEN_CH0_Pos);
 
-  dbg_println("#Configuring BLE...");
+  Serial.println("#Configuring BLE...");
 
   // Setup the BLE LED to be enabled on CONNECT
   // Note: This is actually the default behavior, but provided
   // here in case you want to control this LED manually via PIN 19
-  Bluefruit.setConnLed(LED_RED);
+  // Bluefruit.setConnLed(LED_RED);
   Bluefruit.autoConnLed(true);
 
   // Config the peripheral connection with maximum bandwidth 
@@ -260,7 +237,7 @@ void setup()
   nrfuart.begin();
 
 
-  dbg_println("#Configuring BLE...OK");
+  Serial.println("#Configuring BLE...OK");
 
   // Init RPM circular buffer
   _head = 0;
@@ -274,23 +251,14 @@ void setup()
   NVIC_EnableIRQ(TIMER2_IRQn);
   NRF_TIMER2->TASKS_START = 1;
 
-  // turn on the DMP, now that it's ready
-  if(dmpReady) {
-    dbg_println("Enabling DMP...");
-
-    mpuIntStatus = mpu.getIntStatus();
-    mpuInterrupt = false;
-    mpu.setDMPEnabled(true);
-  }
 
   // Start Advertising
   startAdv();
-  dbg_println("#Bandit BLE...started");
+  Serial.println("#Bandit BLE...started");
 }
 
 // The loop function is called in an endless loop
 uint32_t previousMillis = 0;
-bool ledState = LOW;
 uint8_t lastGear = -1;
 uint32_t lastGEARChanged = 0;
 
@@ -298,35 +266,17 @@ static uint8_t characteristic_buffer[CHARACTERISTIC_BUFFER_LENGTH];
 
 void loop()
 {
+  digitalWrite(LED_GREEN, Serial?LED_ON:LED_OFF);
 
-  if(mpuInterrupt) {
-    mpuIntStatus = mpu.getIntStatus();
-    mpuInterrupt = false;
-    if(mpu.dmpGetCurrentFIFOPacket(fifoBuffer)) {
-      // Update BLE buffer
-      characteristic_buffer[3] = fifoBuffer[1];    // qw_l
-      characteristic_buffer[4] = fifoBuffer[0];    // qw_h
-      characteristic_buffer[5] = fifoBuffer[5];    // qx_l
-      characteristic_buffer[6] = fifoBuffer[4];    // qx_h
-      characteristic_buffer[7] = fifoBuffer[9];    // qy_l
-      characteristic_buffer[8] = fifoBuffer[8];    // qy_h
-      characteristic_buffer[9] = fifoBuffer[13];   // qz_l
-      characteristic_buffer[10] = fifoBuffer[12];  // qz_h
+  processInput();
+  
 
-      characteristic_buffer[11] = fifoBuffer[29];  // ax_l
-      characteristic_buffer[12] = fifoBuffer[28];  // ax_h
-      characteristic_buffer[13] = fifoBuffer[33];  // ay_l
-      characteristic_buffer[14] = fifoBuffer[32];  // ay_h
-      characteristic_buffer[15] = fifoBuffer[37];  // az_l
-      characteristic_buffer[16] = fifoBuffer[36];  // az_h
-    }
-  }
-
-  //processInput();
   uint32_t now = millis();
+
   if (now - previousMillis > REFRESH_RATE)
   {
     uint16_t RPM = getRPM();
+    currentRPM = RPM;
 
     uint8_t g = readGEAR();
     if (g != lastGear)
@@ -351,33 +301,8 @@ void loop()
       characteristic_buffer[2] = currentGear;
       rpmCharacteristic.notify((const unsigned char *)characteristic_buffer, CHARACTERISTIC_BUFFER_LENGTH);
     }
-    else
-    {
-      // ledState = !ledState;
-      // digitalWrite(LED_PIN, ledState);
-    }
 
-#ifdef DEBUG
-      static uint16_t idx=0;
-      if (!idx)
-      {
-        dbg_print("gear=");
-        dbg_print(currentGear);
-        dbg_print(" rpm=");
-        dbg_print(RPM);
-        dbg_print(" Q=[");
-        dbg_print((int16_t)((characteristic_buffer[4]<<8)|characteristic_buffer[3]));
-        dbg_print(',');
-        dbg_print((int16_t)((characteristic_buffer[6]<<8)|characteristic_buffer[5]));
-        dbg_print(',');
-        dbg_print((int16_t)((characteristic_buffer[8]<<8)|characteristic_buffer[7]));
-        dbg_print(',');
-        dbg_print((int16_t)((characteristic_buffer[10]<<8)|characteristic_buffer[9]));
-        dbg_println(']');
 
-      }
-      idx = (idx + 1) % 10;
-#endif
 
 
     previousMillis = now;
@@ -420,6 +345,10 @@ static void startAdv(void)
 // Resolution: 30000 * engineCycles / refreshInterval / engineCylinders RPM (for default values = 20 RPM)
 static uint16_t getRPM()
 {
+  if(_override) {
+    return _overrideRPM;
+  }
+
   noInterrupts();
   uint32_t m1 = _micros[_head];
   uint32_t m0 = _micros[_tail];
@@ -443,6 +372,10 @@ static uint16_t getRPM()
 
 static uint8_t readGEAR()
 {
+  if(_override) {
+    return _overrideGear;
+  }
+
   analogReadResolution(8);
   uint16_t g = analogRead(GEAR_PIN);
 
@@ -474,17 +407,10 @@ static void connect_callback(uint16_t conn_handle)
   BLEConnection* connection = Bluefruit.Connection(conn_handle);
 
   char central_name[32] = { 0 };
-  connection->getPeerName(central_name, sizeof(central_name));
+  connection->getPeerName(central_name, sizeof(central_name)-1);
 
   Serial.print("Connected to ");
   Serial.println(central_name);
-
-
-  // Serial.printf("Connection MTU: %d\n", connection->getMtu());
-  
-  // // request mtu exchange
-  // Serial.printf("Request to change MTU: %d\n",128);
-  // connection->requestMtuExchange(128);
 
 }
 

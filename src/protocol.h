@@ -3,4 +3,6 @@
 
 void processInput();
 
+void setOverride(bool override, int rpm, int gear);
+
 #endif
