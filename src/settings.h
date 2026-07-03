@@ -3,6 +3,14 @@
 
 #include <stdint.h>
 
+// Uncomment to persist settings in external SPI flash (P25Q16H)
+// Requires Adafruit_SPIFlash. The 'flash' object must be initialised before
+// calling readSettings() / writeSettings().
+#define SETTINGS_USE_EXTERNAL_FLASH
+
+// Address of the settings page in external flash (last 4 KB sector)
+#define SETTINGS_FLASH_ADDR   0x1FF000UL
+
 #define MAGIC     0xDEADBEEF
 #define VERSION   10000
 
@@ -29,6 +37,7 @@ typedef struct {
 
 extern settings_t   g_settings;
 
+bool initSettingsStorage();
 bool readSettings();
 bool writeSettings();
 void resetSettings();

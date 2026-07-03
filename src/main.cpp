@@ -9,44 +9,13 @@
 #include "settings.h"
 #include "protocol.h"
 
-#include <SPI.h>
-
-#include "SdFat.h"
-#include <Adafruit_SPIFlash.h>
-
-// for flashTransport definition
-#include "flash_config.h"
-
-
-// Flash Chip declerations, made up from Data Sheets.
-//  https://files.seeedstudio.com/wiki/github_weiruanexample/Flash_P25Q16H-UXH-IR_Datasheet.pdf
-SPIFlash_Device_t const p25q16h{
-  .total_size = (1UL << 21),  // 2MiB
-  .start_up_time_us = 10000,
-  .manufacturer_id = 0x85,
-  .memory_type = 0x60,
-  .capacity = 0x15,
-  .max_clock_speed_mhz = 55,
-  .quad_enable_bit_mask = 0x02,
-  .has_sector_protection = 1,
-  .supports_fast_read = 1,
-  .supports_qspi = 1,
-  .supports_qspi_writes = 1,
-  .write_status_register_split = 1,
-  .single_status_byte = 0,
-  .is_fram = 0,
-};
-
-
-
-
-
-Adafruit_SPIFlash flash(&flashTransport);
 
 
 
 #define TACH_INT_PIN 2
+#define CRANKSHAFT_TEETH  22   // number of VRS pulses per crankshaft revolution
 #define REFRESH_RATE 100 // milliseconds between sensor updates
+#define BLE_NOTIFY_PERIOD_MS REFRESH_RATE // BLE notification interval (ms)
 #define DEBOUNCE_TIME (3 * REFRESH_RATE)
 
 #define LED_ON LED_STATE_ON
@@ -55,6 +24,15 @@ Adafruit_SPIFlash flash(&flashTransport);
 #define LED_PIN LED_RED
 
 #define GEAR_PIN PIN_A2
+
+// ADC gear position thresholds (8-bit, midpoints between measured values per gear)
+// Measured: N=90 / G1=114 / G2=149 / G3=179 / G4=212 / G5=227 / G6=242
+#define GEAR_ADC_THR_12  102   // between gear 1 and 2
+#define GEAR_ADC_THR_23  131   // between gear 2 and 3
+#define GEAR_ADC_THR_34  164   // between gear 3 and 4
+#define GEAR_ADC_THR_45  195   // between gear 4 and 5
+#define GEAR_ADC_THR_56  219   // between gear 5 and 6
+#define GEAR_ADC_THR_6N  234   // above = neutral
 
 #define BANDIT_SERVICE_UUID "2E290000-1EF9-11E9-AB14-D663BD873D93"
 #define BANDIT_RPM_CHAR_UUID "2E290001-1EF9-11E9-AB14-D663BD873D93"
@@ -128,6 +106,8 @@ void setup()
 
   Serial.println("#Starting");
 
+  initSettingsStorage();
+
   Serial.println("#Read settings");
   if (!readSettings())
   {
@@ -160,24 +140,6 @@ void setup()
   }
 
 
-  Serial.println("Adafruit Serial Flash Info example");
-  if(flash.begin(&p25q16h, 1)) {
-
-    // Using a flash device not already listed? Start the flash memory by passing
-    // it the array of device settings defined above, and the number of elements
-    // in the array.
-    // flash.begin(my_flash_devices, flashDevices);
-
-    uint32_t jedec_id = flash.getJEDECID();
-    Serial.print("JEDEC ID: 0x");
-    Serial.println(jedec_id, HEX);
-    Serial.print("Flash size (usable): ");
-    Serial.print(flash.size() / 1024);
-    Serial.println(" KB");
-  } else {
-    Serial.println("Flash...KO");
-  }
-
   // Configure INPUT pin
   uint16_t upin = g_ADigitalPinMap[TACH_INT_PIN];
   NRF_GPIO->PIN_CNF[upin] =
@@ -193,7 +155,7 @@ void setup()
   NRF_TIMER2->MODE = TIMER_MODE_MODE_Counter;                                                  // Set the timer in Counter Mode
   NRF_TIMER2->TASKS_CLEAR = 1;                                                                 // clear the task first to be usable for later
   NRF_TIMER2->BITMODE = TIMER_BITMODE_BITMODE_08Bit;                                           //Set counter to 08 bit resolution
-  NRF_TIMER2->CC[0] = 22;                                                                      // Compare value
+  NRF_TIMER2->CC[0] = CRANKSHAFT_TEETH;                                                       // Compare value (= teeth per revolution)
   NRF_TIMER2->SHORTS = TIMER_SHORTS_COMPARE0_CLEAR_Enabled << TIMER_SHORTS_COMPARE0_CLEAR_Pos; // Enable Compare0/clear shorts
   NRF_TIMER2->INTENSET = TIMER_INTENSET_COMPARE0_Enabled << TIMER_INTENSET_COMPARE0_Pos;
 
@@ -273,7 +235,7 @@ void loop()
 
   uint32_t now = millis();
 
-  if (now - previousMillis > REFRESH_RATE)
+  if (now - previousMillis > BLE_NOTIFY_PERIOD_MS)
   {
     uint16_t RPM = getRPM();
     currentRPM = RPM;
@@ -379,19 +341,19 @@ static uint8_t readGEAR()
   analogReadResolution(8);
   uint16_t g = analogRead(GEAR_PIN);
 
-  //  90 / 114 / 149 / 179 / 212 / 227 / 242
-
-  if (g < 102)
+  //  Measured ADC values per gear: 90 / 114 / 149 / 179 / 212 / 227 / 242
+  //  Thresholds are midpoints between adjacent values
+  if (g < GEAR_ADC_THR_12)
     g = 1;
-  else if (g < 131)
+  else if (g < GEAR_ADC_THR_23)
     g = 2;
-  else if (g < 164)
+  else if (g < GEAR_ADC_THR_34)
     g = 3;
-  else if (g < 195)
+  else if (g < GEAR_ADC_THR_45)
     g = 4;
-  else if (g < 219)
+  else if (g < GEAR_ADC_THR_56)
     g = 5;
-  else if (g < 234)
+  else if (g < GEAR_ADC_THR_6N)
     g = 6;
   else
     g = 0;
