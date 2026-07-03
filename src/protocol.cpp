@@ -9,9 +9,9 @@
 #define PROTO_OVERRIDE_REQ '!'
 
 // Output wrapper — sends to both Serial and BLE UART
-#define OUTPUT_PRINTLN(x) do { Serial.println(x); if(nrfuart.available()) nrfuart.println(x); } while(0)
-#define OUTPUT_PRINT(x)   do { Serial.print(x); if(nrfuart.available()) nrfuart.print(x); } while(0)
-#define OUTPUT_WRITE(x)   do { Serial.write(x); if(nrfuart.available()) nrfuart.write(x); } while(0)
+#define OUTPUT_PRINTLN(x) do { Serial.println(x); nrfuart.println(x); } while(0)
+#define OUTPUT_PRINT(x)   do { Serial.print(x); nrfuart.print(x); } while(0)
+#define OUTPUT_WRITE(x)   do { Serial.write(x); nrfuart.write(x); } while(0)
 
 extern BLEUart nrfuart;
 
@@ -46,19 +46,20 @@ static uint8_t  bleReceived=0;
 
 static uint32_t _reportPeriod=0;
 static uint32_t _lastReport=0;
+static bool _reportUseADC=false;
 
 static int getParamID(const char* str, char** endptr);
 static bool processCharacter(int c, char* buffer, uint8_t* count);
 static void processCommand(const char* buffer);
-static bool processParamRequest();
+static bool processParamRequest(const char* buffer);
 static void sendError(const char* msg);
 static void sendAck();
 static void sendParam(int p);
 static void sendSettings();
 static bool setParam(int p, const char* ptr);
-static bool processQueryRequest();
+static bool processQueryRequest(const char* buffer);
 static void sendReport();
-static bool processOverrideRequest();
+static bool processOverrideRequest(const char* buffer);
 
 
 void processInput()
@@ -291,12 +292,20 @@ static bool processQueryRequest(const char* buffer) {
   unsigned long period;
   const char* ptr= &buffer[1];
   char* endptr;
+  bool useADC = false;
+
+  if(*ptr=='*') {
+    useADC = true;
+    ++ptr;
+  }
   
   if(*ptr==0) {
+    _reportUseADC = useADC;
     sendReport();
   } else {
     period= strtoul(ptr, &endptr, 10);
     if(*endptr!=0) return false;
+    _reportUseADC = useADC;
     _reportPeriod=period;
   }
   return true;
@@ -335,18 +344,23 @@ static bool processOverrideRequest(const char* buffer) {
 
 extern uint8_t currentGear;
 extern uint16_t currentRPM;
+extern uint16_t currentGearRaw;
 
 
 static void sendReport() 
 {
-  int rpm, gear;
+  int rpm;
   rpm = currentRPM;
-  gear = currentGear;
   
   OUTPUT_PRINT(">");
-  OUTPUT_PRINT(gear);
+  if(_reportUseADC) {
+    OUTPUT_PRINT(currentGearRaw);
+  } else {
+    OUTPUT_PRINT(currentGear);
+  }
   OUTPUT_PRINT(",");
   OUTPUT_PRINTLN(rpm);
 }
+  
 
 

@@ -3,7 +3,6 @@
 
 #ifdef SETTINGS_USE_EXTERNAL_FLASH
 #include <SPI.h>
-#include "SdFat.h"
 #include <Adafruit_SPIFlash.h>
 #include "flash_config.h"
 

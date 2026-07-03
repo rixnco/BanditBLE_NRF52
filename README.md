@@ -119,11 +119,15 @@ Response format: `$PARAM=value`
 
 ### `?` — Report
 
+Syntax: `?[*][value]`
+
 | Command | Description |
 |---|---|
 | `?` | Single report: `>gear,rpm` |
+| `?*` | Single report: `>adc,rpm` |
 | `?500` | Periodic report every 500 ms |
-| `?0` | Stop periodic report |
+| `?*500` | Periodic report `>adc,rpm` every 500 ms |
+| `?[*]0` | Stop periodic report |
 
 ### `!` — Override
 
@@ -140,7 +144,8 @@ When override is active the **red LED** is on and the real sensor inputs are ign
 |---|---|
 | `!OK` | Command accepted |
 | `!ERROR,msg` | Command rejected |
-| `>gear,rpm` | Periodic or on-demand report |
+| `>gear,rpm` | Periodic or on-demand report (gear mode) |
+| `>adc,rpm` | Periodic or on-demand report (raw ADC mode) |
 | `#...` | Informational / boot messages |
 | `$PARAM=val` | Parameter value |
 
@@ -179,7 +184,15 @@ Call `initSettingsStorage()` once in `setup()` before `readSettings()`. On first
 | `CRANKSHAFT_TEETH` | `main.cpp` | 22 | VRS pulses per crankshaft revolution |
 | `REFRESH_RATE` | `main.cpp` | 100 ms | Main loop update interval |
 | `BLE_NOTIFY_PERIOD_MS` | `main.cpp` | 100 ms | BLE notification interval |
+| `ENABLE_SPEED_SENSOR` | `main.cpp` | 1 | Enable (`1`) or disable (`0`) rear wheel speed measurement |
 | `GEAR_ADC_THR_12..6N` | `main.cpp` | — | ADC gear position thresholds |
 | `DEFAULT_GEAR1..6` | `settings.h` | 370–867 | Default RPM thresholds per gear |
 | `SETTINGS_USE_EXTERNAL_FLASH` | `settings.h` | defined | Select flash vs BLEBondStore |
 | `SETTINGS_FLASH_ADDR` | `settings.h` | `0x1FF000` | Flash address for settings page |
+
+To disable wheel speed at compile time, add this build flag in your PlatformIO environment:
+
+```ini
+build_flags =
+        -DENABLE_SPEED_SENSOR=0
+```

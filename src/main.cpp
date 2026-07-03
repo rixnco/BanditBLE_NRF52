@@ -6,48 +6,28 @@
 #include <I2Cdev.h>
 #include <MPU6050_6Axis_MotionApps20.h>
 
+#include "config.h"
 #include "settings.h"
 #include "protocol.h"
 
 
 
-
-#define CRANKSHAFT_TEETH      22   // number of VRS pulses per crankshaft revolution
-#define WHEEL_ABS_TEETH       46   // ABS sensor teeth on rear wheel (GSF650 standard)
-#define WHEEL_CIRCUMF_MM    2150   // Tire circumference 140/70R17 in mm
 #define REFRESH_RATE          100 // milliseconds between sensor updates
 #define BLE_NOTIFY_PERIOD_MS  REFRESH_RATE // BLE notification interval (ms)
 #define DEBOUNCE_TIME         (3 * REFRESH_RATE)
 
-#define LED_ON LED_STATE_ON
-#define LED_OFF !LED_STATE_ON
 
-#define LED_PIN LED_RED
-
-#define TACH_INT_PIN          2   // Crankshaft VRS sensor
-#define WHEEL_INT_PIN         5   // Wheel ABS sensor (P0.05)
-#define GEAR_PIN              PIN_A2
+#define BUFFER_SIZE 4 // Must be a power of 2
 
 
-
-// ADC gear position thresholds (8-bit, midpoints between measured values per gear)
-// Measured: G1=90 / G2=114 / G3=149 / G4=179 / G5=212 / G6=227 / N=242
-#define GEAR_ADC_THR_1  102   // below threshold -> gear 1
-#define GEAR_ADC_THR_2  131   // below threshold -> gear 2
-#define GEAR_ADC_THR_3  164   // below threshold -> gear 3
-#define GEAR_ADC_THR_4  195   // below threshold -> gear 4
-#define GEAR_ADC_THR_5  219   // below threshold -> gear 5
-#define GEAR_ADC_THR_6  234   // below threshold -> gear 6
-
-#define IMU_WATCHDOG_TIMEOUT  5000  // Reset DMP if no valid packet for 5s
 
 #define BANDIT_SERVICE_UUID  "2E290000-1EF9-11E9-AB14-D663BD873D93"
 #define BANDIT_RPM_CHAR_UUID "2E290001-1EF9-11E9-AB14-D663BD873D93"
 
 
-static BLEDis  bledis;  // device information
-static BLEUart nrfuart; // NRF uart over ble
-static BLEService banditService = BLEService(BANDIT_SERVICE_UUID);
+BLEDis  bledis;  // device information
+BLEUart nrfuart; // NRF uart over ble
+BLEService banditService = BLEService(BANDIT_SERVICE_UUID);
 
 #define CHARACTERISTIC_BUFFER_LENGTH 18 
 BLECharacteristic rpmCharacteristic = BLECharacteristic(BANDIT_RPM_CHAR_UUID, BLERead | BLENotify, CHARACTERISTIC_BUFFER_LENGTH, true);
@@ -60,21 +40,21 @@ static void startAdv(void);
 
 uint8_t currentGear = -1;
 uint16_t currentRPM = 0;
-uint16_t currentSpeed = 0;  // km/h
+uint16_t currentGearRaw = 0;
 
 static uint16_t getRPM();
-static uint16_t getSpeed();
-static uint8_t readGEAR();
+static uint8_t readGEAR(uint16_t* adcValue = nullptr);
 
-#define BUFFER_SIZE 4 // Must be a power of 2
+#ifdef ENABLE_SPEED_SENSOR
+uint16_t currentSpeed = 0;  // km/h
+static uint16_t getSpeed();
+volatile uint32_t _wheelMicros[BUFFER_SIZE];
+volatile uint8_t _wheelHead, _wheelTail, _wheelSize;
+#endif
 
 // Crankshaft (RPM) buffer
 volatile uint32_t _crankMicros[BUFFER_SIZE];
 volatile uint8_t _crankHead, _crankTail, _crankSize;
-
-// Wheel (Speed) buffer
-volatile uint32_t _wheelMicros[BUFFER_SIZE];
-volatile uint8_t _wheelHead, _wheelTail, _wheelSize;
 
 
 
@@ -83,8 +63,8 @@ volatile int _overrideRPM = 0;
 volatile int _overrideGear = 0;
 
 
+// #define IMU_WATCHDOG_TIMEOUT  5000  // Reset DMP if no valid packet for 5s
 // #define IMU_INT_PIN           7
-
 // MPU6050 DMP variables (kept for reference, LSM6DS3 used for now)
 // static LSM6DS3 myIMU(I2C_MODE, 0x6A);    //I2C device address 0x6A
 // static uint32_t lastValidIMUPacket = 0;   // Timestamp of last valid quaternion
@@ -105,9 +85,11 @@ void crankshaft_buffer_init() {
   _crankHead = _crankTail = _crankSize = 0;
 }
 
+#if ENABLE_SPEED_SENSOR
 void wheel_buffer_init() {
   _wheelHead = _wheelTail = _wheelSize = 0;
 }
+#endif
 
 
 //The setup function is called once at startup of the sketch
@@ -167,7 +149,7 @@ void setup()
 
 
   // Configure INPUT pin
-  uint16_t upin = g_ADigitalPinMap[TACH_INT_PIN];
+  uint16_t upin = g_ADigitalPinMap[CRANKSHAFT_INT_PIN];
   NRF_GPIO->PIN_CNF[upin] =
       ((uint32_t)GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos) | ((uint32_t)GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) | ((uint32_t)GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) | ((uint32_t)GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) | ((uint32_t)GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos);
 
@@ -192,14 +174,15 @@ void setup()
   NRF_PPI->CHEN = (PPI_CHEN_CH0_Enabled << PPI_CHEN_CH0_Pos);
 
   // ==================== WHEEL ABS SENSOR CONFIGURATION ====================
+#if ENABLE_SPEED_SENSOR
 
   // Configure WHEEL_INT_PIN (P0.05) as INPUT
   uint16_t wheel_pin = g_ADigitalPinMap[WHEEL_INT_PIN];
   NRF_GPIO->PIN_CNF[wheel_pin] =
-      ((uint32_t)GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos) | 
-      ((uint32_t)GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) | 
-      ((uint32_t)GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) | 
-      ((uint32_t)GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) | 
+      ((uint32_t)GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos) |
+      ((uint32_t)GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) |
+      ((uint32_t)GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) |
+      ((uint32_t)GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) |
       ((uint32_t)GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos);
 
   // Configure GPIOTE[4] in EVENT mode for wheel ABS sensor
@@ -210,6 +193,7 @@ void setup()
   // Enable GPIOTE interrupt for wheel sensor
   NRF_GPIOTE->INTENSET = (GPIOTE_INTENSET_IN4_Enabled << GPIOTE_INTENSET_IN4_Pos);
   NVIC_EnableIRQ(GPIOTE_IRQn);
+#endif
   
   Serial.println("#Configuring BLE...");
 
@@ -249,7 +233,9 @@ void setup()
 
   // Init RPM and Speed circular buffers
   crankshaft_buffer_init();
+#if ENABLE_SPEED_SENSOR
   wheel_buffer_init();
+#endif
 
   // Start Counting
   NVIC_ClearPendingIRQ(TIMER2_IRQn);
@@ -293,11 +279,14 @@ void loop()
   {
     uint16_t RPM = getRPM();
     currentRPM = RPM;
-    
+
+#ifdef ENABLE_SPEED_SENSOR
     uint16_t speed = getSpeed();
     currentSpeed = speed;
+#endif
 
-    uint8_t g = readGEAR();
+    uint16_t gearRaw = 0;
+    uint8_t g = readGEAR(&gearRaw);
     if (g != lastGear)
     {
       lastGEARChanged = now;
@@ -307,6 +296,7 @@ void loop()
     if (lastGEARChanged && millis() - lastGEARChanged >= DEBOUNCE_TIME)
     {
       currentGear = g;
+      currentGearRaw = gearRaw;
       lastGEARChanged = 0;
     }
 
@@ -318,9 +308,15 @@ void loop()
       characteristic_buffer[0] = (RPM)&0xFF;
       characteristic_buffer[1] = (RPM >> 8) & 0xFF;
       characteristic_buffer[2] = currentGear;
+    #ifdef ENABLE_SPEED_SENSOR
       // Speed: bytes 3-4 (uint16_t LE)
       characteristic_buffer[3] = (speed) & 0xFF;
       characteristic_buffer[4] = (speed >> 8) & 0xFF;
+    #else
+      // Speed feature disabled: keep payload format and force speed bytes to 0xFF
+      characteristic_buffer[3] = 0xFF;
+      characteristic_buffer[4] = 0xFF;
+    #endif
       // Bytes 5-17 reserved for quaternion/future data
       rpmCharacteristic.notify((const unsigned char *)characteristic_buffer, CHARACTERISTIC_BUFFER_LENGTH);
       
@@ -395,6 +391,7 @@ static uint16_t getRPM()
   return (uint16_t)RPM;
 }
 
+#if ENABLE_SPEED_SENSOR
 // checks accumulated wheel ABS pulses and calculates vehicle speed
 // returns vehicle speed in km/h
 // Formula: (pulses_per_second * 60 / WHEEL_ABS_TEETH) * (WHEEL_CIRCUMF_MM / 1000) * 3.6
@@ -423,30 +420,36 @@ static uint16_t getSpeed()
 
   return (uint16_t)(speed > 300 ? 0 : speed);  // Sanity check: max ~300 km/h on motorcycle
 }
+#endif
 
 
-static uint8_t readGEAR()
+static uint8_t readGEAR(uint16_t* rawValue)
 {
   if(_override) {
+    if (rawValue != nullptr) {
+      *rawValue = 0;
+    }
     return _overrideGear;
   }
 
   analogReadResolution(8);
   uint16_t g = analogRead(GEAR_PIN);
+  if (rawValue != nullptr) {
+    *rawValue = g;
+  }
 
-  //  Measured ADC values per gear: 90 / 114 / 149 / 179 / 212 / 227 / 242
-  //  Thresholds are midpoints between adjacent values
-  if (g < GEAR_ADC_THR_1)
+  // Thresholds are stored in settings and can be tuned through serial protocol.
+  if (g < g_settings.gear1)
     g = 1;
-  else if (g < GEAR_ADC_THR_2)
+  else if (g < g_settings.gear2)
     g = 2;
-  else if (g < GEAR_ADC_THR_3)
+  else if (g < g_settings.gear3)
     g = 3;
-  else if (g < GEAR_ADC_THR_4)
+  else if (g < g_settings.gear4)
     g = 4;
-  else if (g < GEAR_ADC_THR_5)
+  else if (g < g_settings.gear5)
     g = 5;
-  else if (g < GEAR_ADC_THR_6)
+  else if (g < g_settings.gear6)
     g = 6;
   else
     g = 0;
@@ -530,6 +533,7 @@ extern "C"
 
   void GPIOTE_IRQHandler(void)
   {
+#if ENABLE_SPEED_SENSOR
     // Wheel ABS sensor interrupt handler (GPIOTE[4])
     
     if ((NRF_GPIOTE->EVENTS_IN[4] == 1) && (NRF_GPIOTE->INTENSET & (1 << 4)))
@@ -548,5 +552,6 @@ extern "C"
         ++_wheelSize;
       }
     }
+#endif
   }
 }
