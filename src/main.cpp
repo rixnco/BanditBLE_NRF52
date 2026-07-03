@@ -83,11 +83,11 @@ volatile int _overrideRPM = 0;
 volatile int _overrideGear = 0;
 
 
-#define IMU_INT_PIN           7
+// #define IMU_INT_PIN           7
 
 // MPU6050 DMP variables (kept for reference, LSM6DS3 used for now)
-static LSM6DS3 myIMU(I2C_MODE, 0x6A);    //I2C device address 0x6A
-static uint32_t lastValidIMUPacket = 0;   // Timestamp of last valid quaternion
+// static LSM6DS3 myIMU(I2C_MODE, 0x6A);    //I2C device address 0x6A
+// static uint32_t lastValidIMUPacket = 0;   // Timestamp of last valid quaternion
 
 
 void setOverride(bool override, int rpm, int gear) {
@@ -156,14 +156,14 @@ void setup()
   Serial.println(g_settings.gear6);
 
 
-  Wire.begin();
-  Wire.setClock(400000);
+  // Wire.begin();
+  // Wire.setClock(400000);
 
-  if (myIMU.begin() != 0) {
-      Serial.println("myIMU error");
-  } else {
-      Serial.println("myIMU OK!");
-  }
+  // if (myIMU.begin() != 0) {
+  //     Serial.println("myIMU error");
+  // } else {
+  //     Serial.println("myIMU OK!");
+  // }
 
 
   // Configure INPUT pin
@@ -276,17 +276,18 @@ void loop()
 
   processInput();
   
-  // IMU watchdog: reset if no valid packet for too long
+  // // IMU watchdog: reset if no valid packet for too long
+  // uint32_t now = millis();
+  // if (now - lastValidIMUPacket > IMU_WATCHDOG_TIMEOUT) {
+  //   Serial.println("#IMU watchdog: reinitializing");
+  //   lastValidIMUPacket = now;
+  //   // In a real MPU6050 DMP scenario, you'd reset the DMP here:
+  //   // mpu.resetFIFO();
+  //   // mpu.setDMPEnabled(false);
+  //   // delay(10);
+  //   // mpu.setDMPEnabled(true);
+  // }
   uint32_t now = millis();
-  if (now - lastValidIMUPacket > IMU_WATCHDOG_TIMEOUT) {
-    Serial.println("#IMU watchdog: reinitializing");
-    lastValidIMUPacket = now;
-    // In a real MPU6050 DMP scenario, you'd reset the DMP here:
-    // mpu.resetFIFO();
-    // mpu.setDMPEnabled(false);
-    // delay(10);
-    // mpu.setDMPEnabled(true);
-  }
 
   if (now - previousMillis > BLE_NOTIFY_PERIOD_MS)
   {
@@ -323,10 +324,10 @@ void loop()
       // Bytes 5-17 reserved for quaternion/future data
       rpmCharacteristic.notify((const unsigned char *)characteristic_buffer, CHARACTERISTIC_BUFFER_LENGTH);
       
-      // Mark successful update for IMU watchdog
-      if(RPM > 0 || speed > 0) {
-        lastValidIMUPacket = now;
-      }
+      // // Mark successful update for IMU watchdog
+      // if(RPM > 0 || speed > 0) {
+      //   lastValidIMUPacket = now;
+      // }
     }
 
     previousMillis = now;
