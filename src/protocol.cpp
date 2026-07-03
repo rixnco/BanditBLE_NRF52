@@ -9,9 +9,9 @@
 #define PROTO_OVERRIDE_REQ '!'
 
 // Output wrapper — sends to both Serial and BLE UART
-#define OUTPUT_PRINTLN(x) do { Serial.println(x); if(nrfuart.enabled()) nrfuart.println(x); } while(0)
-#define OUTPUT_PRINT(x)   do { Serial.print(x); if(nrfuart.enabled()) nrfuart.print(x); } while(0)
-#define OUTPUT_WRITE(x)   do { Serial.write(x); if(nrfuart.enabled()) nrfuart.write(x); } while(0)
+#define OUTPUT_PRINTLN(x) do { Serial.println(x); if(nrfuart.available()) nrfuart.println(x); } while(0)
+#define OUTPUT_PRINT(x)   do { Serial.print(x); if(nrfuart.available()) nrfuart.print(x); } while(0)
+#define OUTPUT_WRITE(x)   do { Serial.write(x); if(nrfuart.available()) nrfuart.write(x); } while(0)
 
 extern BLEUart nrfuart;
 
@@ -38,20 +38,24 @@ static const char* PARAM_NAME[] = {
 
 
 
-static char     inBuffer[64];
-static uint8_t  received=0;
+static char     serialBuffer[64];
+static uint8_t  serialReceived=0;
+
+static char     bleBuffer[64];
+static uint8_t  bleReceived=0;
+
 static uint32_t _reportPeriod=0;
 static uint32_t _lastReport=0;
 
 static int getParamID(const char* str, char** endptr);
-static bool processCharacter(int c);
-static void processCommand();
+static bool processCharacter(int c, char* buffer, uint8_t* count);
+static void processCommand(const char* buffer);
 static bool processParamRequest();
 static void sendError(const char* msg);
 static void sendAck();
 static void sendParam(int p);
 static void sendSettings();
-static bool setParam(int p, char* ptr);
+static bool setParam(int p, const char* ptr);
 static bool processQueryRequest();
 static void sendReport();
 static bool processOverrideRequest();
@@ -70,55 +74,55 @@ void processInput()
   // Process Serial input
   if(Serial.available()) {
     int c = Serial.read();
-    if(processCharacter(c)) {
-      processCommand();
-      received = 0;
-      inBuffer[0] = 0;
+    if(processCharacter(c, serialBuffer, &serialReceived)) {
+      processCommand(serialBuffer);
+      serialReceived = 0;
+      serialBuffer[0] = 0;
     }
   }
 
-  // Process BLE UART input
-  if(nrfuart.enabled() && nrfuart.available()) {
+  // Process BLE UART input (if connected)
+  if(nrfuart.available()) {
     int c = nrfuart.read();
-    if(processCharacter(c)) {
-      processCommand();
-      received = 0;
-      inBuffer[0] = 0;
+    if(processCharacter(c, bleBuffer, &bleReceived)) {
+      processCommand(bleBuffer);
+      bleReceived = 0;
+      bleBuffer[0] = 0;
     }
   }
 }
 
 // Helper to process a single character into the command buffer
-static bool processCharacter(int c)
+static bool processCharacter(int c, char* buffer, uint8_t* count)
 {
   if(c == '\n') {
-    inBuffer[received++] = 0;
+    buffer[(*count)++] = 0;
     return true;  // command complete
-  } else if(received < 63) {
+  } else if(*count < 63) {
     // Ignore carriage returns, white spaces and tabs
     if(c != '\r' && c != ' ' && c != '\t') {
-      inBuffer[received++] = c;
+      buffer[(*count)++] = c;
     }
   }
   return false;  // incomplete
 }
 
-// Process the complete command in inBuffer
-static void processCommand()
+// Process the complete command in buffer
+static void processCommand(const char* buffer)
 {
-  if(received == 0) return;
+  if(buffer[0] == 0) return;
   
-  switch(inBuffer[0]) {
+  switch(buffer[0]) {
     case PROTO_PARAM_REQ:
-      if(!processParamRequest()) sendError("Invalid parameter request");
+      if(!processParamRequest(buffer)) sendError("Invalid parameter request");
       else sendAck();  
       break;
     case PROTO_QUERY_REQ:
-      if(!processQueryRequest()) sendError("Invalid query request");
+      if(!processQueryRequest(buffer)) sendError("Invalid query request");
       else sendAck();  
       break;
     case PROTO_OVERRIDE_REQ:
-      if(!processOverrideRequest()) sendError("Invalid override request");
+      if(!processOverrideRequest(buffer)) sendError("Invalid override request");
       break;
     default:
       sendError("Unknown command");
@@ -146,9 +150,9 @@ static int getParamID(const char* str, char** endptr) {
 
 
 
-static bool processParamRequest() 
+static bool processParamRequest(const char* buffer) 
 {
-  char* ptr= &inBuffer[1];
+  const char* ptr= &buffer[1];
 
   switch(*ptr) {
    case '$':
@@ -177,7 +181,7 @@ static bool processParamRequest()
     return true;
     break;
   default:
-    int p= getParamID(ptr, &ptr);
+    int p= getParamID(ptr, (char**)&ptr);
     if(p==-1) return false;
     if(*ptr==0) {
       sendParam(p);
@@ -230,49 +234,49 @@ static void sendSettings() {
 }
 
 
-static bool setParam(int p, char* ptr) {
-  float f;
+static bool setParam(int p, const char* ptr) {
   unsigned long  ul;
+  char* endptr;
   
   switch(p) {
     case PARAM_GEAR1: 
-      ul= strtoul(ptr, &ptr, 10);
-      if(*ptr!=0) return false;
+      ul= strtoul(ptr, &endptr, 10);
+      if(*endptr!=0) return false;
       noInterrupts();
       g_settings.gear1=ul;
       interrupts();
       break;
     case PARAM_GEAR2: 
-      ul= strtoul(ptr, &ptr, 10);
-      if(*ptr!=0) return false;
+      ul= strtoul(ptr, &endptr, 10);
+      if(*endptr!=0) return false;
       noInterrupts();
       g_settings.gear2=ul;
       interrupts();
       break;
     case PARAM_GEAR3: 
-      ul= strtoul(ptr, &ptr, 10);
-      if(*ptr!=0) return false;
+      ul= strtoul(ptr, &endptr, 10);
+      if(*endptr!=0) return false;
       noInterrupts();
       g_settings.gear3=ul;
       interrupts();
       break;
     case PARAM_GEAR4: 
-      ul= strtoul(ptr, &ptr, 10);
-      if(*ptr!=0) return false;
+      ul= strtoul(ptr, &endptr, 10);
+      if(*endptr!=0) return false;
       noInterrupts();
       g_settings.gear4=ul;
       interrupts();
       break;
     case PARAM_GEAR5: 
-      ul= strtoul(ptr, &ptr, 10);
-      if(*ptr!=0) return false;
+      ul= strtoul(ptr, &endptr, 10);
+      if(*endptr!=0) return false;
       noInterrupts();
       g_settings.gear5=ul;
       interrupts();
       break;
     case PARAM_GEAR6: 
-      ul= strtoul(ptr, &ptr, 10);
-      if(*ptr!=0) return false;
+      ul= strtoul(ptr, &endptr, 10);
+      if(*endptr!=0) return false;
       noInterrupts();
       g_settings.gear6=ul;
       interrupts();
@@ -283,22 +287,24 @@ static bool setParam(int p, char* ptr) {
   return true;
 }
 
-static bool processQueryRequest() {
+static bool processQueryRequest(const char* buffer) {
   unsigned long period;
-  char* ptr= &inBuffer[1];
+  const char* ptr= &buffer[1];
+  char* endptr;
   
   if(*ptr==0) {
     sendReport();
   } else {
-    period= strtoul(ptr, &ptr, 10);
-    if(*ptr!=0) return false;
+    period= strtoul(ptr, &endptr, 10);
+    if(*endptr!=0) return false;
     _reportPeriod=period;
   }
   return true;
 }
 
-static bool processOverrideRequest() {
-  char* ptr= &inBuffer[1];
+static bool processOverrideRequest(const char* buffer) {
+  const char* ptr= &buffer[1];
+  char* endptr;
   unsigned long  ul;
   uint16_t rpm;
   uint8_t gear;
@@ -310,10 +316,12 @@ static bool processOverrideRequest() {
     setOverride(false, 0, 0);
     break;
   default:
-    ul= strtoul(ptr, &ptr, 10);
+    ul= strtoul(ptr, &endptr, 10);
+    ptr = endptr;
     if(*ptr++!=',') return false;
     gear = ul;
-    ul= strtoul(ptr, &ptr, 10);
+    ul= strtoul(ptr, &endptr, 10);
+    ptr = endptr;
     if(*ptr!=0) return false;
     rpm = ul;
 
