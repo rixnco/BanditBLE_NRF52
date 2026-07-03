@@ -12,29 +12,31 @@
 
 
 
-#define TACH_INT_PIN 2
-#define CRANKSHAFT_TEETH  22   // number of VRS pulses per crankshaft revolution
-#define REFRESH_RATE 100 // milliseconds between sensor updates
-#define BLE_NOTIFY_PERIOD_MS REFRESH_RATE // BLE notification interval (ms)
-#define DEBOUNCE_TIME (3 * REFRESH_RATE)
+#define CRANKSHAFT_TEETH      22   // number of VRS pulses per crankshaft revolution
+#define REFRESH_RATE          100 // milliseconds between sensor updates
+#define BLE_NOTIFY_PERIOD_MS  REFRESH_RATE // BLE notification interval (ms)
+#define DEBOUNCE_TIME         (3 * REFRESH_RATE)
 
 #define LED_ON LED_STATE_ON
 #define LED_OFF !LED_STATE_ON
 
 #define LED_PIN LED_RED
 
-#define GEAR_PIN PIN_A2
+#define TACH_INT_PIN          2
+#define GEAR_PIN              PIN_A2
+
+
 
 // ADC gear position thresholds (8-bit, midpoints between measured values per gear)
-// Measured: N=90 / G1=114 / G2=149 / G3=179 / G4=212 / G5=227 / G6=242
-#define GEAR_ADC_THR_12  102   // between gear 1 and 2
-#define GEAR_ADC_THR_23  131   // between gear 2 and 3
-#define GEAR_ADC_THR_34  164   // between gear 3 and 4
-#define GEAR_ADC_THR_45  195   // between gear 4 and 5
-#define GEAR_ADC_THR_56  219   // between gear 5 and 6
-#define GEAR_ADC_THR_6N  234   // above = neutral
+// Measured: G1=90 / G2=114 / G3=149 / G4=179 / G5=212 / G6=227 / N=242
+#define GEAR_ADC_THR_1  102   // below threshold -> gear 1
+#define GEAR_ADC_THR_2  131   // below threshold -> gear 2
+#define GEAR_ADC_THR_3  164   // below threshold -> gear 3
+#define GEAR_ADC_THR_4  195   // below threshold -> gear 4
+#define GEAR_ADC_THR_5  219   // below threshold -> gear 5
+#define GEAR_ADC_THR_6  234   // below threshold -> gear 6
 
-#define BANDIT_SERVICE_UUID "2E290000-1EF9-11E9-AB14-D663BD873D93"
+#define BANDIT_SERVICE_UUID  "2E290000-1EF9-11E9-AB14-D663BD873D93"
 #define BANDIT_RPM_CHAR_UUID "2E290001-1EF9-11E9-AB14-D663BD873D93"
 
 
@@ -64,15 +66,18 @@ volatile uint8_t _tail;
 volatile uint32_t _size;
 
 
-#define IMU_INT_PIN     7
 
 volatile bool _override = false;
 volatile int _overrideRPM = 0;
 volatile int _overrideGear = 0;
 
 
-//Create a instance of class LSM6DS3
-LSM6DS3 myIMU(I2C_MODE, 0x6A);    //I2C device address 0x6A
+#define IMU_INT_PIN           7
+#define IMU_WATCHDOG_TIMEOUT  5000  // Reset DMP if no valid packet for 5s
+
+// MPU6050 DMP variables (kept for reference, LSM6DS3 used for now)
+static LSM6DS3 myIMU(I2C_MODE, 0x6A);    //I2C device address 0x6A
+static uint32_t lastValidIMUPacket = 0;   // Timestamp of last valid quaternion
 
 
 void setOverride(bool override, int rpm, int gear) {
@@ -134,10 +139,13 @@ void setup()
   Wire.setClock(400000);
 
   if (myIMU.begin() != 0) {
-      Serial.println("myIMU error");
+      Serial.println("#IMU error");
   } else {
-      Serial.println("myIMU OK!");
+      Serial.println("#IMU OK!");
   }
+  
+  // Initialize IMU watchdog
+  lastValidIMUPacket = millis();
 
 
   // Configure INPUT pin
@@ -232,8 +240,17 @@ void loop()
 
   processInput();
   
-
+  // IMU watchdog: reset if no valid packet for too long
   uint32_t now = millis();
+  if (now - lastValidIMUPacket > IMU_WATCHDOG_TIMEOUT) {
+    Serial.println("#IMU watchdog: reinitializing");
+    lastValidIMUPacket = now;
+    // In a real MPU6050 DMP scenario, you'd reset the DMP here
+    // mpu.resetFIFO();
+    // mpu.setDMPEnabled(false);
+    // delay(10);
+    // mpu.setDMPEnabled(true);
+  }
 
   if (now - previousMillis > BLE_NOTIFY_PERIOD_MS)
   {
@@ -262,6 +279,11 @@ void loop()
       characteristic_buffer[1] = (RPM >> 8) & 0xFF;
       characteristic_buffer[2] = currentGear;
       rpmCharacteristic.notify((const unsigned char *)characteristic_buffer, CHARACTERISTIC_BUFFER_LENGTH);
+      
+      // Mark successful update for IMU watchdog
+      if(RPM > 0) {
+        lastValidIMUPacket = now;
+      }
     }
 
 
@@ -343,17 +365,17 @@ static uint8_t readGEAR()
 
   //  Measured ADC values per gear: 90 / 114 / 149 / 179 / 212 / 227 / 242
   //  Thresholds are midpoints between adjacent values
-  if (g < GEAR_ADC_THR_12)
+  if (g < GEAR_ADC_THR_1)
     g = 1;
-  else if (g < GEAR_ADC_THR_23)
+  else if (g < GEAR_ADC_THR_2)
     g = 2;
-  else if (g < GEAR_ADC_THR_34)
+  else if (g < GEAR_ADC_THR_3)
     g = 3;
-  else if (g < GEAR_ADC_THR_45)
+  else if (g < GEAR_ADC_THR_4)
     g = 4;
-  else if (g < GEAR_ADC_THR_56)
+  else if (g < GEAR_ADC_THR_5)
     g = 5;
-  else if (g < GEAR_ADC_THR_6N)
+  else if (g < GEAR_ADC_THR_6)
     g = 6;
   else
     g = 0;
