@@ -13,6 +13,8 @@
 
 
 #define CRANKSHAFT_TEETH      22   // number of VRS pulses per crankshaft revolution
+#define WHEEL_ABS_TEETH       46   // ABS sensor teeth on rear wheel (GSF650 standard)
+#define WHEEL_CIRCUMF_MM    2150   // Tire circumference 140/70R17 in mm
 #define REFRESH_RATE          100 // milliseconds between sensor updates
 #define BLE_NOTIFY_PERIOD_MS  REFRESH_RATE // BLE notification interval (ms)
 #define DEBOUNCE_TIME         (3 * REFRESH_RATE)
@@ -22,7 +24,8 @@
 
 #define LED_PIN LED_RED
 
-#define TACH_INT_PIN          2
+#define TACH_INT_PIN          2   // Crankshaft VRS sensor
+#define WHEEL_INT_PIN         5   // Wheel ABS sensor (P0.05)
 #define GEAR_PIN              PIN_A2
 
 
@@ -35,6 +38,8 @@
 #define GEAR_ADC_THR_4  195   // below threshold -> gear 4
 #define GEAR_ADC_THR_5  219   // below threshold -> gear 5
 #define GEAR_ADC_THR_6  234   // below threshold -> gear 6
+
+#define IMU_WATCHDOG_TIMEOUT  5000  // Reset DMP if no valid packet for 5s
 
 #define BANDIT_SERVICE_UUID  "2E290000-1EF9-11E9-AB14-D663BD873D93"
 #define BANDIT_RPM_CHAR_UUID "2E290001-1EF9-11E9-AB14-D663BD873D93"
@@ -55,15 +60,21 @@ static void startAdv(void);
 
 uint8_t currentGear = -1;
 uint16_t currentRPM = 0;
+uint16_t currentSpeed = 0;  // km/h
 
 static uint16_t getRPM();
+static uint16_t getSpeed();
 static uint8_t readGEAR();
 
 #define BUFFER_SIZE 4 // Must be a power of 2
-volatile uint32_t _micros[BUFFER_SIZE];
-volatile uint8_t _head;
-volatile uint8_t _tail;
-volatile uint32_t _size;
+
+// Crankshaft (RPM) buffer
+volatile uint32_t _crankMicros[BUFFER_SIZE];
+volatile uint8_t _crankHead, _crankTail, _crankSize;
+
+// Wheel (Speed) buffer
+volatile uint32_t _wheelMicros[BUFFER_SIZE];
+volatile uint8_t _wheelHead, _wheelTail, _wheelSize;
 
 
 
@@ -73,7 +84,6 @@ volatile int _overrideGear = 0;
 
 
 #define IMU_INT_PIN           7
-#define IMU_WATCHDOG_TIMEOUT  5000  // Reset DMP if no valid packet for 5s
 
 // MPU6050 DMP variables (kept for reference, LSM6DS3 used for now)
 static LSM6DS3 myIMU(I2C_MODE, 0x6A);    //I2C device address 0x6A
@@ -87,6 +97,17 @@ void setOverride(bool override, int rpm, int gear) {
   digitalWrite(LED_RED, _override?LED_ON:LED_OFF);
 }
 
+// ============================================================================
+// SENSOR BUFFER MANAGEMENT - Dual sensor support (crankshaft + wheel ABS)
+// ============================================================================
+
+void crankshaft_buffer_init() {
+  _crankHead = _crankTail = _crankSize = 0;
+}
+
+void wheel_buffer_init() {
+  _wheelHead = _wheelTail = _wheelSize = 0;
+}
 
 
 //The setup function is called once at startup of the sketch
@@ -139,13 +160,10 @@ void setup()
   Wire.setClock(400000);
 
   if (myIMU.begin() != 0) {
-      Serial.println("#IMU error");
+      Serial.println("myIMU error");
   } else {
-      Serial.println("#IMU OK!");
+      Serial.println("myIMU OK!");
   }
-  
-  // Initialize IMU watchdog
-  lastValidIMUPacket = millis();
 
 
   // Configure INPUT pin
@@ -173,6 +191,26 @@ void setup()
   // Enable PPI channel 0
   NRF_PPI->CHEN = (PPI_CHEN_CH0_Enabled << PPI_CHEN_CH0_Pos);
 
+  // ==================== WHEEL ABS SENSOR CONFIGURATION ====================
+
+  // Configure WHEEL_INT_PIN (P0.05) as INPUT
+  uint16_t wheel_pin = g_ADigitalPinMap[WHEEL_INT_PIN];
+  NRF_GPIO->PIN_CNF[wheel_pin] =
+      ((uint32_t)GPIO_PIN_CNF_DIR_Input << GPIO_PIN_CNF_DIR_Pos) | 
+      ((uint32_t)GPIO_PIN_CNF_INPUT_Connect << GPIO_PIN_CNF_INPUT_Pos) | 
+      ((uint32_t)GPIO_PIN_CNF_PULL_Pullup << GPIO_PIN_CNF_PULL_Pos) | 
+      ((uint32_t)GPIO_PIN_CNF_DRIVE_S0S1 << GPIO_PIN_CNF_DRIVE_Pos) | 
+      ((uint32_t)GPIO_PIN_CNF_SENSE_Disabled << GPIO_PIN_CNF_SENSE_Pos);
+
+  // Configure GPIOTE[4] in EVENT mode for wheel ABS sensor
+  NRF_GPIOTE->CONFIG[4] = (GPIOTE_CONFIG_MODE_Event << GPIOTE_CONFIG_MODE_Pos);
+  NRF_GPIOTE->CONFIG[4] |= ((wheel_pin << GPIOTE_CONFIG_PSEL_Pos) & GPIOTE_CONFIG_PSEL_Msk) |
+                           ((GPIOTE_CONFIG_POLARITY_HiToLo << GPIOTE_CONFIG_POLARITY_Pos) & GPIOTE_CONFIG_POLARITY_Msk);
+
+  // Enable GPIOTE interrupt for wheel sensor
+  NRF_GPIOTE->INTENSET = (GPIOTE_INTENSET_IN4_Enabled << GPIOTE_INTENSET_IN4_Pos);
+  NVIC_EnableIRQ(GPIOTE_IRQn);
+  
   Serial.println("#Configuring BLE...");
 
   // Setup the BLE LED to be enabled on CONNECT
@@ -209,11 +247,9 @@ void setup()
 
   Serial.println("#Configuring BLE...OK");
 
-  // Init RPM circular buffer
-  _head = 0;
-  _tail = 0;
-  _size = 0;
-  _micros[_head] = 0;
+  // Init RPM and Speed circular buffers
+  crankshaft_buffer_init();
+  wheel_buffer_init();
 
   // Start Counting
   NVIC_ClearPendingIRQ(TIMER2_IRQn);
@@ -245,7 +281,7 @@ void loop()
   if (now - lastValidIMUPacket > IMU_WATCHDOG_TIMEOUT) {
     Serial.println("#IMU watchdog: reinitializing");
     lastValidIMUPacket = now;
-    // In a real MPU6050 DMP scenario, you'd reset the DMP here
+    // In a real MPU6050 DMP scenario, you'd reset the DMP here:
     // mpu.resetFIFO();
     // mpu.setDMPEnabled(false);
     // delay(10);
@@ -256,6 +292,9 @@ void loop()
   {
     uint16_t RPM = getRPM();
     currentRPM = RPM;
+    
+    uint16_t speed = getSpeed();
+    currentSpeed = speed;
 
     uint8_t g = readGEAR();
     if (g != lastGear)
@@ -278,16 +317,17 @@ void loop()
       characteristic_buffer[0] = (RPM)&0xFF;
       characteristic_buffer[1] = (RPM >> 8) & 0xFF;
       characteristic_buffer[2] = currentGear;
+      // Speed: bytes 3-4 (uint16_t LE)
+      characteristic_buffer[3] = (speed) & 0xFF;
+      characteristic_buffer[4] = (speed >> 8) & 0xFF;
+      // Bytes 5-17 reserved for quaternion/future data
       rpmCharacteristic.notify((const unsigned char *)characteristic_buffer, CHARACTERISTIC_BUFFER_LENGTH);
       
       // Mark successful update for IMU watchdog
-      if(RPM > 0) {
+      if(RPM > 0 || speed > 0) {
         lastValidIMUPacket = now;
       }
     }
-
-
-
 
     previousMillis = now;
   }
@@ -334,16 +374,16 @@ static uint16_t getRPM()
   }
 
   noInterrupts();
-  uint32_t m1 = _micros[_head];
-  uint32_t m0 = _micros[_tail];
-  if (_size > 0 && micros() - m1 > 250000)
+  uint32_t m1 = _crankMicros[_crankHead];
+  uint32_t m0 = _crankMicros[_crankTail];
+  if (_crankSize > 0 && micros() - m1 > 250000)
   {
     // Reset buffer if last value older than 250ms.
-    _size = 0;
-    _head = 0;
-    _tail = 0;
+    _crankSize = 0;
+    _crankHead = 0;
+    _crankTail = 0;
   }
-  uint8_t s = _size;
+  uint8_t s = _crankSize;
   interrupts();
 
   if (s < 2)
@@ -353,6 +393,36 @@ static uint16_t getRPM()
 
   return (uint16_t)RPM;
 }
+
+// checks accumulated wheel ABS pulses and calculates vehicle speed
+// returns vehicle speed in km/h
+// Formula: (pulses_per_second * 60 / WHEEL_ABS_TEETH) * (WHEEL_CIRCUMF_MM / 1000) * 3.6
+static uint16_t getSpeed()
+{
+  noInterrupts();
+  uint32_t m1 = _wheelMicros[_wheelHead];
+  uint32_t m0 = _wheelMicros[_wheelTail];
+  if (_wheelSize > 0 && micros() - m1 > 500000)
+  {
+    // Reset buffer if last value older than 500ms (vehicle stopped)
+    _wheelSize = 0;
+    _wheelHead = 0;
+    _wheelTail = 0;
+  }
+  uint8_t s = _wheelSize;
+  interrupts();
+
+  if (s < 2)
+    return 0;
+
+  // Calculate frequency: Hz = (s-1) / (m1-m0) * 1,000,000
+  // Speed = (Hz / WHEEL_ABS_TEETH * 60) * (WHEEL_CIRCUMF_MM / 1000) * 3.6
+  // Simplified: Speed (km/h) = (s-1) * 60 * 3.6 * WHEEL_CIRCUMF_MM / (WHEEL_ABS_TEETH * (m1-m0) * 1000)
+  uint32_t speed = (s - 1) * 60 * 3600 * WHEEL_CIRCUMF_MM / (WHEEL_ABS_TEETH * (m1 - m0) * 1000);
+
+  return (uint16_t)(speed > 300 ? 0 : speed);  // Sanity check: max ~300 km/h on motorcycle
+}
+
 
 static uint8_t readGEAR()
 {
@@ -437,21 +507,44 @@ extern "C"
 {
   void TIMER2_IRQHandler(void)
   {
+    // Crankshaft VRS sensor interrupt handler
 
     if (NRF_TIMER2->EVENTS_COMPARE[0] == 1)
     {
       NRF_TIMER2->EVENTS_COMPARE[0] = 0;
 
-      _head = _size == 0 ? _head : (++_head) & (BUFFER_SIZE - 1);
-      _micros[_head] = micros();
+      _crankHead = _crankSize == 0 ? _crankHead : (++_crankHead) & (BUFFER_SIZE - 1);
+      _crankMicros[_crankHead] = micros();
 
-      if (_size == BUFFER_SIZE)
+      if (_crankSize == BUFFER_SIZE)
       {
-        _tail = (++_tail) & (BUFFER_SIZE - 1);
+        _crankTail = (++_crankTail) & (BUFFER_SIZE - 1);
       }
       else
       {
-        ++_size;
+        ++_crankSize;
+      }
+    }
+  }
+
+  void GPIOTE_IRQHandler(void)
+  {
+    // Wheel ABS sensor interrupt handler (GPIOTE[4])
+    
+    if ((NRF_GPIOTE->EVENTS_IN[4] == 1) && (NRF_GPIOTE->INTENSET & (1 << 4)))
+    {
+      NRF_GPIOTE->EVENTS_IN[4] = 0;
+      
+      _wheelHead = _wheelSize == 0 ? _wheelHead : (++_wheelHead) & (BUFFER_SIZE - 1);
+      _wheelMicros[_wheelHead] = micros();
+
+      if (_wheelSize == BUFFER_SIZE)
+      {
+        _wheelTail = (++_wheelTail) & (BUFFER_SIZE - 1);
+      }
+      else
+      {
+        ++_wheelSize;
       }
     }
   }
