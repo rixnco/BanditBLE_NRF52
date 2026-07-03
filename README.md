@@ -103,6 +103,8 @@ A **debounce of 300 ms** (`3 × REFRESH_RATE`) filters transitions before updati
 
 Text-based, line-terminated (`\n`). The first character of each line is the opcode.
 
+**All commands work on both Serial (USB) and BLE UART simultaneously.** Responses are sent to both channels if a BLE client is connected.
+
 ### `$` — Parameters
 
 | Command | Description |

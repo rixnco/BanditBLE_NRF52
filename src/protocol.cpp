@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <bluefruit.h>
 #include "settings.h"
 #include "protocol.h"
 
@@ -6,6 +7,13 @@
 #define PROTO_QUERY_REQ    '?'
 #define PROTO_PARAM_REQ    '$'
 #define PROTO_OVERRIDE_REQ '!'
+
+// Output wrapper — sends to both Serial and BLE UART
+#define OUTPUT_PRINTLN(x) do { Serial.println(x); if(nrfuart.enabled()) nrfuart.println(x); } while(0)
+#define OUTPUT_PRINT(x)   do { Serial.print(x); if(nrfuart.enabled()) nrfuart.print(x); } while(0)
+#define OUTPUT_WRITE(x)   do { Serial.write(x); if(nrfuart.enabled()) nrfuart.write(x); } while(0)
+
+extern BLEUart nrfuart;
 
 
 // Configuration parameters ID
@@ -36,17 +44,16 @@ static uint32_t _reportPeriod=0;
 static uint32_t _lastReport=0;
 
 static int getParamID(const char* str, char** endptr);
-
+static bool processCharacter(int c);
+static void processCommand();
 static bool processParamRequest();
 static void sendError(const char* msg);
 static void sendAck();
 static void sendParam(int p);
 static void sendSettings();
 static bool setParam(int p, char* ptr);
-
 static bool processQueryRequest();
 static void sendReport();
-
 static bool processOverrideRequest();
 
 
@@ -60,37 +67,61 @@ void processInput()
     sendReport();
   }
 
-
-  if( !Serial.available() ) return;
-   
-  // Read Serial input.
-  int c;
-  c= Serial.read();
-  if(c=='\n') {
-    inBuffer[received++]=0;
-    switch(inBuffer[0]) {
-      case PROTO_PARAM_REQ:
-        if(!processParamRequest()) sendError("Invalid parameter request");
-        else sendAck();  
-        break;
-      case PROTO_QUERY_REQ:
-        if(!processQueryRequest()) sendError("Invalid query request");
-        else sendAck();  
-        break;
-      case PROTO_OVERRIDE_REQ:
-        if(!processOverrideRequest()) sendError("Invalid override request");
-        // else sendAck();  
-        break;
-      default:
-        sendError("Unknown command");
+  // Process Serial input
+  if(Serial.available()) {
+    int c = Serial.read();
+    if(processCharacter(c)) {
+      processCommand();
+      received = 0;
+      inBuffer[0] = 0;
     }
-    // Command processed.
-    // Reset buffer
-    received=0;
-    inBuffer[0]=0;
-  } else if(received<63) {
+  }
+
+  // Process BLE UART input
+  if(nrfuart.enabled() && nrfuart.available()) {
+    int c = nrfuart.read();
+    if(processCharacter(c)) {
+      processCommand();
+      received = 0;
+      inBuffer[0] = 0;
+    }
+  }
+}
+
+// Helper to process a single character into the command buffer
+static bool processCharacter(int c)
+{
+  if(c == '\n') {
+    inBuffer[received++] = 0;
+    return true;  // command complete
+  } else if(received < 63) {
     // Ignore carriage returns, white spaces and tabs
-    if(c!='\r' && c!=' ' && c!='\t' ) inBuffer[received++]= c;
+    if(c != '\r' && c != ' ' && c != '\t') {
+      inBuffer[received++] = c;
+    }
+  }
+  return false;  // incomplete
+}
+
+// Process the complete command in inBuffer
+static void processCommand()
+{
+  if(received == 0) return;
+  
+  switch(inBuffer[0]) {
+    case PROTO_PARAM_REQ:
+      if(!processParamRequest()) sendError("Invalid parameter request");
+      else sendAck();  
+      break;
+    case PROTO_QUERY_REQ:
+      if(!processQueryRequest()) sendError("Invalid query request");
+      else sendAck();  
+      break;
+    case PROTO_OVERRIDE_REQ:
+      if(!processOverrideRequest()) sendError("Invalid override request");
+      break;
+    default:
+      sendError("Unknown command");
   }
 }
 
@@ -130,10 +161,8 @@ static bool processParamRequest()
     break;
    case '<':
     // Store settings.
-    // noInterrupts();
     writeSettings();
-    // interrupts();
-    Serial.println("!SETTINGS,stored");
+    OUTPUT_PRINTLN("!SETTINGS,stored");
     return true;
     break;
    case '>':
@@ -143,8 +172,8 @@ static bool processParamRequest()
       resetSettings();
       writeSettings();
     }
-    if(b) Serial.println("!SETTINGS,restored");
-    else Serial.println("!SETTINGS,default");
+    if(b) OUTPUT_PRINTLN("!SETTINGS,restored");
+    else OUTPUT_PRINTLN("!SETTINGS,default");
     return true;
     break;
   default:
@@ -163,33 +192,34 @@ static bool processParamRequest()
 
 static void sendError(const char* msg)
 {
-  Serial.print("!ERROR");
+  OUTPUT_PRINT("!ERROR");
   if(msg!=NULL) {
-    Serial.print(","); Serial.println(msg);
+    OUTPUT_PRINT(",");
+    OUTPUT_PRINTLN(msg);
   } else {
-    Serial.println(); 
+    OUTPUT_PRINTLN("");
   }
 }
 
 static void sendAck()
 {
-  Serial.println("!OK");
+  OUTPUT_PRINTLN("!OK");
 }
 
 
 static void sendParam(int p) {
   if(p<0 || p>=PARAM_LAST) return;
-  Serial.print("$");
-  Serial.print(PARAM_NAME[p]);
-  Serial.print("=");
+  OUTPUT_PRINT("$");
+  OUTPUT_PRINT(PARAM_NAME[p]);
+  OUTPUT_PRINT("=");
   switch(p) {
-    case PARAM_GEAR1: Serial.println(g_settings.gear1); break;
-    case PARAM_GEAR2: Serial.println(g_settings.gear2); break;
-    case PARAM_GEAR3: Serial.println(g_settings.gear3); break;
-    case PARAM_GEAR4: Serial.println(g_settings.gear4); break;
-    case PARAM_GEAR5: Serial.println(g_settings.gear5); break;
-    case PARAM_GEAR6: Serial.println(g_settings.gear6); break;
-    default: Serial.println("???");
+    case PARAM_GEAR1: OUTPUT_PRINTLN(g_settings.gear1); break;
+    case PARAM_GEAR2: OUTPUT_PRINTLN(g_settings.gear2); break;
+    case PARAM_GEAR3: OUTPUT_PRINTLN(g_settings.gear3); break;
+    case PARAM_GEAR4: OUTPUT_PRINTLN(g_settings.gear4); break;
+    case PARAM_GEAR5: OUTPUT_PRINTLN(g_settings.gear5); break;
+    case PARAM_GEAR6: OUTPUT_PRINTLN(g_settings.gear6); break;
+    default: OUTPUT_PRINTLN("???");
   }
 }
 
@@ -305,9 +335,10 @@ static void sendReport()
   rpm = currentRPM;
   gear = currentGear;
   
-  Serial.print(">"); Serial.print(gear);
-  Serial.print(","); Serial.print(rpm); 
-  Serial.println();
+  OUTPUT_PRINT(">");
+  OUTPUT_PRINT(gear);
+  OUTPUT_PRINT(",");
+  OUTPUT_PRINTLN(rpm);
 }
 
 
