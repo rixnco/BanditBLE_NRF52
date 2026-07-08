@@ -19,12 +19,18 @@
 
 // Wheel speed sensor feature.
 // Comment to disable.
-// #define ENABLE_SPEED_SENSOR
+#define ENABLE_SPEED_SENSOR
 
 #ifdef ENABLE_SPEED_SENSOR
-#define WHEEL_INT_PIN          5   // Wheel ABS sensor (P0.05)
-#define WHEEL_ABS_TEETH       46   // ABS sensor teeth on rear wheel (GSF650 standard)
-#define WHEEL_CIRCUMF_MM    2150   // Tire circumference 140/70R17 in mm
+#define WHEEL_INT_PIN          5   // VSS capteur boîte de vitesses (P0.05)
+
+// VSS boîte de vitesses GSF650 : ~4 impulsions / tour arbre secondaire.
+// Rapport final GSF650 : 43/17 = 2.529 → ~10.1 impulsions / tour roue.
+// !! VALEUR A CALIBRER : compter les impulsions à vitesse connue et ajuster.
+// Procédure : rouler à 50 km/h, mesurer fréquence (Hz) → pulses/km = Hz / (50/3.6)
+#define WHEEL_ABS_TEETH       10   // impulsions VSS par tour roue (à calibrer !)
+
+#define WHEEL_CIRCUMF_MM    2150   // Circonférence pneu 140/70R17 en mm
 #endif
 
 // Gear feature
