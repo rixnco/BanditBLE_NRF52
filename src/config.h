@@ -51,6 +51,7 @@
 
 #ifdef IMU_USE_MPU6050_DMP
 #define IMU_FIFO_RATE         10     // 100 Hz (to match BLE 100ms period)
+#define IMU_DMP_WATCHDOG      1000   // Reset DMP if no valid packet for 1s
 #endif
 #endif
 
