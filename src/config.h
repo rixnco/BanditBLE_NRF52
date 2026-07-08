@@ -33,6 +33,27 @@
 #define WHEEL_CIRCUMF_MM    2150   // Circonférence pneu 140/70R17 en mm
 #endif
 
+// Accelerometer feature.
+// Comment to disable.
+#define ENABLE_ACCELEROMETER
+
+#ifdef ENABLE_ACCELEROMETER
+// Select IMU type: LSM6DS3 or MPU6050 (DMP mode)
+// Uncomment one:
+#define IMU_USE_LSM6DS3
+// #define IMU_USE_MPU6050_DMP
+
+#ifdef IMU_USE_LSM6DS3
+#define IMU_I2C_ADDR          0x6A   // LSM6DS3 default I2C address
+#define IMU_ACCEL_SCALE       2      // ±2g (for optimal precision)
+#define IMU_ACCEL_ODR         3      // 104 Hz (close to 100ms BLE period)
+#endif
+
+#ifdef IMU_USE_MPU6050_DMP
+#define IMU_FIFO_RATE         10     // 100 Hz (to match BLE 100ms period)
+#endif
+#endif
+
 // Gear feature
 #define GEAR_PIN              PIN_A2
 

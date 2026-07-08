@@ -25,11 +25,38 @@
 #define BANDIT_RPM_CHAR_UUID "2E290001-1EF9-11E9-AB14-D663BD873D93"
 
 
+// ============================================================================
+// ACCELEROMETER INITIALIZATION
+// ============================================================================
+#ifdef ENABLE_ACCELEROMETER
+
+#ifdef IMU_USE_LSM6DS3
+static LSM6DS3 myIMU(I2C_MODE, IMU_I2C_ADDR);
+#endif
+
+#ifdef IMU_USE_MPU6050_DMP
+static MPU6050 mpu;
+static uint8_t mpuIntStatus;
+static uint16_t packetSize;
+static uint8_t fifoBuffer[64];
+static Quaternion q;
+#endif
+
+struct {
+  int16_t x;
+  int16_t y;
+  int16_t z;
+} currentAccel = {0, 0, 0};
+
+static bool readAcceleration();
+
+#endif
+
 BLEDis  bledis;  // device information
 BLEUart nrfuart; // NRF uart over ble
 BLEService banditService = BLEService(BANDIT_SERVICE_UUID);
 
-#define CHARACTERISTIC_BUFFER_LENGTH 18 
+#define CHARACTERISTIC_BUFFER_LENGTH 20 
 BLECharacteristic rpmCharacteristic = BLECharacteristic(BANDIT_RPM_CHAR_UUID, BLERead | BLENotify, CHARACTERISTIC_BUFFER_LENGTH, true);
 
 
@@ -138,15 +165,48 @@ void setup()
   Serial.println(g_settings.gear6);
 
 
-  // Wire.begin();
-  // Wire.setClock(400000);
+  // ==================== ACCELEROMETER INITIALIZATION ====================
+#ifdef ENABLE_ACCELEROMETER
+  Wire.begin();
+  Wire.setClock(400000);
 
-  // if (myIMU.begin() != 0) {
-  //     Serial.println("myIMU error");
-  // } else {
-  //     Serial.println("myIMU OK!");
-  // }
+#ifdef IMU_USE_LSM6DS3
+  Serial.println("#Initializing LSM6DS3...");
+  if (myIMU.begin() != 0) {
+    Serial.println("LSM6DS3 init error!");
+  } else {
+    Serial.println("LSM6DS3 OK!");
+    // Configure for optimal precision
+    myIMU.settings.accelRange = IMU_ACCEL_SCALE;  // ±2g
+    myIMU.settings.accelSampleRate = IMU_ACCEL_ODR;  // 104 Hz
+    myIMU.settings.accelBandWidth = 0;  // Auto
+    myIMU.settings.gyroRange = 245;  // ±245 deg/s (we don't use gyro but set it)
+    myIMU.settings.gyroSampleRate = IMU_ACCEL_ODR;
+  }
+#endif
 
+#ifdef IMU_USE_MPU6050_DMP
+  Serial.println("#Initializing MPU6050 DMP...");
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed!");
+  } else {
+    Serial.println("MPU6050 connection OK!");
+    // Initialize DMP
+    uint8_t devStatus = mpu.dmpInitialize();
+    if (devStatus == 0) {
+      mpu.setDMPEnabled(true);
+      packetSize = mpu.dmpGetFIFOPacketSize();
+      Serial.println("DMP initialized successfully!");
+    } else {
+      Serial.print("DMP init failed (code ");
+      Serial.print(devStatus);
+      Serial.println(")");
+    }
+  }
+#endif
+
+#endif
 
   // Configure INPUT pin
   uint16_t upin = g_ADigitalPinMap[CRANKSHAFT_INT_PIN];
@@ -237,6 +297,9 @@ void setup()
   wheel_buffer_init();
 #endif
 
+  // Initialize BLE characteristic buffer (bytes 11-19 reserved for future use)
+  memset(characteristic_buffer, 0, CHARACTERISTIC_BUFFER_LENGTH);
+
   // Start Counting
   NVIC_ClearPendingIRQ(TIMER2_IRQn);
   NVIC_SetPriority(TIMER2_IRQn, 3);
@@ -317,7 +380,33 @@ void loop()
       characteristic_buffer[3] = 0xFF;
       characteristic_buffer[4] = 0xFF;
     #endif
-      // Bytes 5-17 reserved for quaternion/future data
+
+    #ifdef ENABLE_ACCELEROMETER
+      // Read accelerometer data at same rate as BLE updates
+      readAcceleration();
+      
+      // Accelerometer: bytes 5-10 (3x int16_t LE)
+      // X-axis (bytes 5-6)
+      characteristic_buffer[5] = (currentAccel.x) & 0xFF;
+      characteristic_buffer[6] = (currentAccel.x >> 8) & 0xFF;
+      // Y-axis (bytes 7-8)
+      characteristic_buffer[7] = (currentAccel.y) & 0xFF;
+      characteristic_buffer[8] = (currentAccel.y >> 8) & 0xFF;
+      // Z-axis (bytes 9-10)
+      characteristic_buffer[9] = (currentAccel.z) & 0xFF;
+      characteristic_buffer[10] = (currentAccel.z >> 8) & 0xFF;
+      // Bytes 11-19 reserved for future data
+    #else
+      // Accelerometer feature disabled: force accel bytes to 0xFF
+      characteristic_buffer[5] = 0xFF;
+      characteristic_buffer[6] = 0xFF;
+      characteristic_buffer[7] = 0xFF;
+      characteristic_buffer[8] = 0xFF;
+      characteristic_buffer[9] = 0xFF;
+      characteristic_buffer[10] = 0xFF;
+    #endif
+
+      // Bytes 11-19 reserved for future data (already initialized to 0)
       rpmCharacteristic.notify((const unsigned char *)characteristic_buffer, CHARACTERISTIC_BUFFER_LENGTH);
       
       // // Mark successful update for IMU watchdog
@@ -456,6 +545,84 @@ static uint8_t readGEAR(uint16_t* rawValue)
 
   return (uint8_t)(g);
 }
+
+
+// ============================================================================
+// ACCELEROMETER DATA READING
+// ============================================================================
+#ifdef ENABLE_ACCELEROMETER
+
+static bool readAcceleration()
+{
+#ifdef IMU_USE_LSM6DS3
+  // Read LSM6DS3 accelerometer data
+  // Returns: true if data was successfully read, false otherwise
+  
+  float accelX = 0, accelY = 0, accelZ = 0;
+  
+  // The LSM6DS3 library stores raw data in public members
+  // But we should use the readAccel functions
+  myIMU.readAccelData();
+  
+  // Get acceleration in g's (LSM6DS3 provides calibrated data)
+  // Convert to milli-g for int16_t storage (range -32000 to +32000 = -32g to +32g)
+  accelX = myIMU.calcAccel(myIMU.accelX);  // in g
+  accelY = myIMU.calcAccel(myIMU.accelY);  // in g
+  accelZ = myIMU.calcAccel(myIMU.accelZ);  // in g
+  
+  // Convert from g to milli-g (multiply by 1000) for int16_t
+  currentAccel.x = (int16_t)(accelX * 1000);
+  currentAccel.y = (int16_t)(accelY * 1000);
+  currentAccel.z = (int16_t)(accelZ * 1000);
+  
+  return true;
+#endif
+
+#ifdef IMU_USE_MPU6050_DMP
+  // Read MPU6050 quaternion from DMP FIFO
+  mpuIntStatus = mpu.getIntStatus();
+  
+  uint16_t fifoCount = mpu.getFIFOCount();
+  
+  if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+    // FIFO overflow
+    mpu.resetFIFO();
+    Serial.println("FIFO overflow!");
+    return false;
+  } 
+  else if (mpuIntStatus & 0x02) {
+    // DMP data ready
+    while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
+    
+    mpu.getFIFOBytes(fifoBuffer, packetSize);
+    
+    // Get quaternion
+    mpu.dmpGetQuaternion(&q, fifoBuffer);
+    
+    // Convert quaternion to acceleration estimate
+    // For simplicity, we extract acceleration from DMP packet
+    // Note: DMP provides quaternion, not direct acceleration
+    // We can either use quaternion or read raw accel separately
+    
+    // Read raw acceleration
+    int16_t ax, ay, az;
+    mpu.getAcceleration(&ax, &ay, &az);
+    
+    // Store in milli-g (MPU6050 raw values are already in appropriate scale)
+    currentAccel.x = ax;
+    currentAccel.y = ay;
+    currentAccel.z = az;
+    
+    return true;
+  }
+  
+  return false;
+#endif
+
+  return true;
+}
+
+#endif
 
 
 // callback invoked when central connects
