@@ -1,8 +1,11 @@
 #ifndef __PROTOCOL_H__
 #define __PROTOCOL_H__
 
-void processInput();
+class SettingsManager;
+class SensorProvider;
+class BanditController;
 
-void setOverride(bool override, int rpm, int gear);
+void initProtocol(SettingsManager& settings, SensorProvider& sensors, BanditController& controller);
+void processInput();
 
 #endif

@@ -19,13 +19,12 @@ typedef struct {
   uint16_t gear4;
   uint16_t gear5;
   uint16_t gear6;
+  int16_t imu_x;  // Accelerometer X offset (milli-g units)
+  int16_t imu_y;  // Accelerometer Y offset (milli-g units)
+  int16_t imu_z;  // Accelerometer Z offset (milli-g units)
 } settings_t;
 
-extern settings_t   g_settings;
-
-bool initSettingsStorage();
-bool readSettings();
-bool writeSettings();
-void resetSettings();
+// Returns a settings_t populated with the compile-time defaults.
+settings_t settingsDefaults();
 
 #endif

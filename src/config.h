@@ -40,18 +40,25 @@
 #ifdef ENABLE_ACCELEROMETER
 // Select IMU type: LSM6DS3 or MPU6050 (DMP mode)
 // Uncomment one:
-#define IMU_USE_LSM6DS3
-// #define IMU_USE_MPU6050_DMP
+// #define IMU_USE_LSM6DS3
+#define IMU_USE_MPU6050_DMP
 
 #ifdef IMU_USE_LSM6DS3
-#define IMU_I2C_ADDR          0x6A   // LSM6DS3 default I2C address
+#define IMU_I2C_ADDR          0x6A   // LSM6DS3 I2C address
+#define IMU_I2C_BUS           1      // Wire1 (I2C1)
+#define IMU_I2C_SDA           7      // P0_07 (SDA for I2C1)
+#define IMU_I2C_SCL           27     // P0_27 (SCL for I2C1)
 #define IMU_ACCEL_SCALE       2      // ±2g (for optimal precision)
 #define IMU_ACCEL_ODR         3      // 104 Hz (close to 100ms BLE period)
 #endif
 
 #ifdef IMU_USE_MPU6050_DMP
-#define IMU_FIFO_RATE         10     // 100 Hz (to match BLE 100ms period)
-#define IMU_DMP_WATCHDOG      1000   // Reset DMP if no valid packet for 1s
+#define IMU_I2C_BUS           0      // Wire (I2C0)
+#define IMU_I2C_SDA           4      // P0_04 (SDA for I2C0)
+#define IMU_I2C_SCL           5      // P0_05 (SCL for I2C0)
+#define IMU_ACCEL_RANGE       1      // 0=±2g, 1=±8g, 2=±16g (±8g for motorcycling)
+#define IMU_DLPF_BW           4      // DLPF: 0=260Hz, 1=184Hz, 2=94Hz, 3=44Hz, 4=21Hz, 5=10Hz, 6=5Hz
+#define IMU_ZERO_CALIB        1      // Enable zero-g calibration at startup (100 samples @ rest)
 #endif
 #endif
 
