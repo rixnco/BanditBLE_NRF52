@@ -4,10 +4,13 @@
 #include "Wire.h"
 
 #include <I2Cdev.h>
-#include <MPU6050_6Axis_MotionApps20.h>
+#include <MPU6050.h>
 
 #include "config.h"
 #include "settings.h"
+#include "SettingsStore.h"
+#include "SettingsManager.h"
+#include "ProtocolHandler.h"
 #include "protocol.h"
 
 
@@ -17,7 +20,7 @@
 #define DEBOUNCE_TIME         (3 * REFRESH_RATE)
 
 
-#define BUFFER_SIZE 4 // Must be a power of 2
+#define RPM_TIMESTAMP_BUFFER_SIZE 4 // Must be a power of 2
 
 
 
@@ -36,11 +39,6 @@ static LSM6DS3 myIMU(I2C_MODE, IMU_I2C_ADDR);
 
 #ifdef IMU_USE_MPU6050_DMP
 static MPU6050 mpu;
-static uint8_t mpuIntStatus;
-static uint16_t packetSize;
-static uint8_t fifoBuffer[64];
-static Quaternion q;
-static uint32_t lastValidDMPPacket = 0;
 #endif
 
 struct {
@@ -70,18 +68,20 @@ uint8_t currentGear = -1;
 uint16_t currentRPM = 0;
 uint16_t currentGearRaw = 0;
 
+static uint8_t characteristic_buffer[CHARACTERISTIC_BUFFER_LENGTH];
+
 static uint16_t getRPM();
 static uint8_t readGEAR(uint16_t* adcValue = nullptr);
 
 #ifdef ENABLE_SPEED_SENSOR
 uint16_t currentSpeed = 0;  // km/h
 static uint16_t getSpeed();
-volatile uint32_t _wheelMicros[BUFFER_SIZE];
+volatile uint32_t _wheelMicros[RPM_TIMESTAMP_BUFFER_SIZE];
 volatile uint8_t _wheelHead, _wheelTail, _wheelSize;
 #endif
 
 // Crankshaft (RPM) buffer
-volatile uint32_t _crankMicros[BUFFER_SIZE];
+volatile uint32_t _crankMicros[RPM_TIMESTAMP_BUFFER_SIZE];
 volatile uint8_t _crankHead, _crankTail, _crankSize;
 
 
@@ -91,19 +91,42 @@ volatile int _overrideRPM = 0;
 volatile int _overrideGear = 0;
 
 
-// #define IMU_WATCHDOG_TIMEOUT  5000  // Reset DMP if no valid packet for 5s
-// #define IMU_INT_PIN           7
-// MPU6050 DMP variables (kept for reference, LSM6DS3 used for now)
-// static LSM6DS3 myIMU(I2C_MODE, 0x6A);    //I2C device address 0x6A
-// static uint32_t lastValidIMUPacket = 0;   // Timestamp of last valid quaternion
-
-
 void setOverride(bool override, int rpm, int gear) {
   _override = override;
   _overrideRPM = rpm;
   _overrideGear = gear;
   digitalWrite(LED_RED, _override?LED_ON:LED_OFF);
 }
+
+// Single settings instance (unique source of truth), backed by the
+// compile-time selected persistence store.
+static SettingsManager settings(getDefaultSettingsStore());
+
+#ifdef ENABLE_ACCELEROMETER
+void calibrateIMU();
+#endif
+
+// Application façade exposed to the protocol layer through interfaces,
+// replacing the previous extern-global coupling.
+class BanditApp : public SensorProvider, public BanditController {
+public:
+  uint8_t  getCurrentGear() override    { return currentGear; }
+  uint16_t getCurrentRPM() override     { return currentRPM; }
+  uint16_t getCurrentGearRaw() override { return currentGearRaw; }
+
+  void onOverride(bool enabled, int rpm, int gear) override {
+    setOverride(enabled, rpm, gear);
+  }
+
+  void onCalibrateIMU() override {
+#ifdef ENABLE_ACCELEROMETER
+    calibrateIMU();
+#endif
+  }
+};
+
+static BanditApp banditApp;
+
 
 // ============================================================================
 // SENSOR BUFFER MANAGEMENT - Dual sensor support (crankshaft + wheel ABS)
@@ -113,7 +136,7 @@ void crankshaft_buffer_init() {
   _crankHead = _crankTail = _crankSize = 0;
 }
 
-#if ENABLE_SPEED_SENSOR
+#ifdef ENABLE_SPEED_SENSOR
 void wheel_buffer_init() {
   _wheelHead = _wheelTail = _wheelSize = 0;
 }
@@ -142,34 +165,57 @@ void setup()
 
   Serial.println("#Starting");
 
-  initSettingsStorage();
+  settings.init();
 
   Serial.println("#Read settings");
-  if (!readSettings())
+  if (!settings.load())
   {
     Serial.println("#Default settings");
-    resetSettings();
     Serial.println("#Write settings");
-    writeSettings();
+    settings.save();
   }
-  Serial.print("$GEAR1=");
-  Serial.println(g_settings.gear1);
-  Serial.print("$GEAR2=");
-  Serial.println(g_settings.gear2);
-  Serial.print("$GEAR3=");
-  Serial.println(g_settings.gear3);
-  Serial.print("$GEAR4=");
-  Serial.println(g_settings.gear4);
-  Serial.print("$GEAR5=");
-  Serial.println(g_settings.gear5);
-  Serial.print("$GEAR6=");
-  Serial.println(g_settings.gear6);
+  for (uint8_t i = 1; i <= 6; ++i)
+  {
+    Serial.print("$GEAR");
+    Serial.print(i);
+    Serial.print("=");
+    Serial.println(settings.getGear(i));
+  }
 
 
   // ==================== ACCELEROMETER INITIALIZATION ====================
 #ifdef ENABLE_ACCELEROMETER
+  // Initialize I2C buses with correct pin assignments for nRF52
+  // Note: nRF52 Wire.begin() uses default pins from variant
+  // For custom pins, use Wire.setPins() if available
+  
+#ifdef IMU_USE_LSM6DS3
+  // LSM6DS3 on I2C1 (Wire1): SDA=P0_07, SCL=P0_27
+  // Try to configure Wire1 with custom pins (nRF52 specific)
+  #if defined(NRF52)
+    Wire1.setPins(IMU_I2C_SDA, IMU_I2C_SCL);  // P0_07, P0_27
+  #endif
+  Wire1.begin();
+  Wire1.setClock(400000);
+  Serial.println("#I2C1 initialized for LSM6DS3 (SDA=P0_07, SCL=P0_27)");
+#endif
+
+#ifdef IMU_USE_MPU6050_DMP
+  // MPU6050 on I2C0 (Wire): SDA=P0_04, SCL=P0_05
+  // Configure Wire with custom pins for MPU6050
+  #if defined(NRF52)
+    Wire.setPins(IMU_I2C_SDA, IMU_I2C_SCL);  // P0_04, P0_05
+  #endif
   Wire.begin();
   Wire.setClock(400000);
+  Serial.println("#I2C0 initialized for MPU6050 (SDA=P0_04, SCL=P0_05)");
+#endif
+
+#if !defined(IMU_USE_LSM6DS3) && !defined(IMU_USE_MPU6050_DMP)
+  // Fallback: initialize default Wire
+  Wire.begin();
+  Wire.setClock(400000);
+#endif
 
 #ifdef IMU_USE_LSM6DS3
   Serial.println("#Initializing LSM6DS3...");
@@ -187,24 +233,63 @@ void setup()
 #endif
 
 #ifdef IMU_USE_MPU6050_DMP
-  Serial.println("#Initializing MPU6050 DMP...");
+  Serial.println("#Initializing MPU6050...");
   mpu.initialize();
   if (!mpu.testConnection()) {
     Serial.println("MPU6050 connection failed!");
   } else {
     Serial.println("MPU6050 connection OK!");
-    // Initialize DMP
-    uint8_t devStatus = mpu.dmpInitialize();
-    if (devStatus == 0) {
-      mpu.setDMPEnabled(true);
-      packetSize = mpu.dmpGetFIFOPacketSize();
-      lastValidDMPPacket = millis();  // Initialize watchdog timer
-      Serial.println("DMP initialized successfully!");
-    } else {
-      Serial.print("DMP init failed (code ");
-      Serial.print(devStatus);
-      Serial.println(")");
+    
+    // Configure accelerometer full-scale range
+    // 0=±2g, 1=±8g, 2=±16g (IMU_ACCEL_RANGE default=1 for ±8g)
+    mpu.setFullScaleAccelRange(IMU_ACCEL_RANGE);
+    Serial.print("#MPU6050 Full-Scale: ±");
+    Serial.print((2 << IMU_ACCEL_RANGE));
+    Serial.println("g");
+    
+    // Configure Digital Low Pass Filter (DLPF)
+    // Reduces noise, especially useful for motorcycle vibrations
+    // Mode 4 = 21Hz cutoff frequency (good balance between noise and responsiveness)
+    mpu.setDLPFMode(IMU_DLPF_BW);
+    Serial.print("#MPU6050 DLPF mode: ");
+    Serial.println(IMU_DLPF_BW);
+    
+#ifdef IMU_ZERO_CALIB
+    // Zero-g calibration: read 100 samples at rest to get average offsets
+    // This compensates for manufacturing offsets and orientation bias
+    if (getRPM() == 0)  // Only calibrate when engine is stopped
+    {
+      Serial.println("#Calibrating MPU6050 zero-g offsets...");
+      int16_t ax_sum = 0, ay_sum = 0, az_sum = 0;
+      const int calib_samples = 100;
+      
+      for (int i = 0; i < calib_samples; i++) {
+        int16_t ax, ay, az;
+        mpu.getAcceleration(&ax, &ay, &az);
+        ax_sum += ax;
+        ay_sum += ay;
+        az_sum += az;
+        delay(10);
+      }
+      
+      // Calculate average offsets (works at any orientation: horizontal or kickstand)
+      int16_t ax_offset = ax_sum / calib_samples;
+      int16_t ay_offset = ay_sum / calib_samples;
+      int16_t az_offset = az_sum / calib_samples;
+      // Note: We use raw offsets without gravity compensation.
+      // This ensures calibration works whether bike is upright, on kickstand, or at any angle.
+      
+      mpu.setXAccelOffset(ax_offset);
+      mpu.setYAccelOffset(ay_offset);
+      mpu.setZAccelOffset(az_offset);
+      Serial.print("#MPU6050 offsets: X=");
+      Serial.print(ax_offset);
+      Serial.print(" Y=");
+      Serial.print(ay_offset);
+      Serial.print(" Z=");
+      Serial.println(az_offset);
     }
+#endif
   }
 #endif
 
@@ -236,7 +321,7 @@ void setup()
   NRF_PPI->CHEN = (PPI_CHEN_CH0_Enabled << PPI_CHEN_CH0_Pos);
 
   // ==================== WHEEL ABS SENSOR CONFIGURATION ====================
-#if ENABLE_SPEED_SENSOR
+#ifdef ENABLE_SPEED_SENSOR
 
   // Configure WHEEL_INT_PIN (P0.05) as INPUT
   uint16_t wheel_pin = g_ADigitalPinMap[WHEEL_INT_PIN];
@@ -295,12 +380,11 @@ void setup()
 
   // Init RPM and Speed circular buffers
   crankshaft_buffer_init();
-#if ENABLE_SPEED_SENSOR
+#ifdef ENABLE_SPEED_SENSOR
   wheel_buffer_init();
 #endif
 
-  // Initialize BLE characteristic buffer
-  // Structure: RPM(2) | Gear(1) | Speed(2) | AccelXYZ(6) = 11 bytes
+  // Initialize BLE characteristic buffer to 0
   memset(characteristic_buffer, 0, CHARACTERISTIC_BUFFER_LENGTH);
 
   // Start Counting
@@ -309,6 +393,8 @@ void setup()
   NVIC_EnableIRQ(TIMER2_IRQn);
   NRF_TIMER2->TASKS_START = 1;
 
+  // Initialize Protocol Handler
+  initProtocol(settings, banditApp, banditApp);
 
   // Start Advertising
   startAdv();
@@ -319,8 +405,6 @@ void setup()
 uint32_t previousMillis = 0;
 uint8_t lastGear = -1;
 uint32_t lastGEARChanged = 0;
-
-static uint8_t characteristic_buffer[CHARACTERISTIC_BUFFER_LENGTH];
 
 void loop()
 {
@@ -482,7 +566,7 @@ static uint16_t getRPM()
   return (uint16_t)RPM;
 }
 
-#if ENABLE_SPEED_SENSOR
+#ifdef ENABLE_SPEED_SENSOR
 // checks accumulated wheel ABS pulses and calculates vehicle speed
 // returns vehicle speed in km/h
 // Formula: (pulses_per_second * 60 / WHEEL_ABS_TEETH) * (WHEEL_CIRCUMF_MM / 1000) * 3.6
@@ -530,17 +614,17 @@ static uint8_t readGEAR(uint16_t* rawValue)
   }
 
   // Thresholds are stored in settings and can be tuned through serial protocol.
-  if (g < g_settings.gear1)
+  if (g < settings.getGear(1))
     g = 1;
-  else if (g < g_settings.gear2)
+  else if (g < settings.getGear(2))
     g = 2;
-  else if (g < g_settings.gear3)
+  else if (g < settings.getGear(3))
     g = 3;
-  else if (g < g_settings.gear4)
+  else if (g < settings.getGear(4))
     g = 4;
-  else if (g < g_settings.gear5)
+  else if (g < settings.getGear(5))
     g = 5;
-  else if (g < g_settings.gear6)
+  else if (g < settings.getGear(6))
     g = 6;
   else
     g = 0;
@@ -550,6 +634,87 @@ static uint8_t readGEAR(uint16_t* rawValue)
 
 
 // ============================================================================
+// ACCELEROMETER CALIBRATION
+// ============================================================================
+#ifdef ENABLE_ACCELEROMETER
+
+void calibrateIMU()
+{
+  Serial.println("#IMU calibration starting...");
+  
+#ifdef IMU_USE_LSM6DS3
+  // LSM6DS3 software calibration: read 100 samples and store averages
+  float ax_sum = 0.0f, ay_sum = 0.0f, az_sum = 0.0f;
+  const int calib_samples = 100;
+  
+  for (int i = 0; i < calib_samples; i++) {
+    float ax = myIMU.readFloatAccelX();
+    float ay = myIMU.readFloatAccelY();
+    float az = myIMU.readFloatAccelZ();
+    ax_sum += ax;
+    ay_sum += ay;
+    az_sum += az;
+    delay(10);
+  }
+  
+  // Calculate average offsets in milli-g
+  int16_t imu_x = (int16_t)(ax_sum / calib_samples * 1000.0f);
+  int16_t imu_y = (int16_t)(ay_sum / calib_samples * 1000.0f);
+  int16_t imu_z = (int16_t)(az_sum / calib_samples * 1000.0f);
+  settings.setImuOffsets(imu_x, imu_y, imu_z);
+  
+  Serial.print("#LSM6DS3 calibration: X=");
+  Serial.print(imu_x);
+  Serial.print(" Y=");
+  Serial.print(imu_y);
+  Serial.print(" Z=");
+  Serial.println(imu_z);
+#endif
+
+#ifdef IMU_USE_MPU6050_DMP
+  // MPU6050 hardware calibration: read raw offsets and apply via registers
+  int16_t ax_sum = 0, ay_sum = 0, az_sum = 0;
+  const int calib_samples = 100;
+  
+  for (int i = 0; i < calib_samples; i++) {
+    int16_t ax, ay, az;
+    mpu.getAcceleration(&ax, &ay, &az);
+    ax_sum += ax;
+    ay_sum += ay;
+    az_sum += az;
+    delay(10);
+  }
+  
+  // Calculate average offsets (raw units at ±8g: ~4096 LSB/g)
+  int16_t ax_offset = ax_sum / calib_samples;
+  int16_t ay_offset = ay_sum / calib_samples;
+  int16_t az_offset = az_sum / calib_samples;
+  
+  // Apply hardware offsets
+  mpu.setXAccelOffset(ax_offset);
+  mpu.setYAccelOffset(ay_offset);
+  mpu.setZAccelOffset(az_offset);
+  
+  // Store in settings as milli-g (for reference: 4096 LSB/g at ±8g = 244 milli-g/LSB)
+  int16_t imu_x = (int16_t)(ax_offset / 4.096f);
+  int16_t imu_y = (int16_t)(ay_offset / 4.096f);
+  int16_t imu_z = (int16_t)(az_offset / 4.096f);
+  settings.setImuOffsets(imu_x, imu_y, imu_z);
+  
+  Serial.print("#MPU6050 calibration: X=");
+  Serial.print(imu_x);
+  Serial.print(" Y=");
+  Serial.print(imu_y);
+  Serial.print(" Z=");
+  Serial.println(imu_z);
+#endif
+  
+  Serial.println("#IMU calibration complete - use $< to save settings");
+}
+
+#endif
+
+// ============================================================================
 // ACCELEROMETER DATA READING
 // ============================================================================
 #ifdef ENABLE_ACCELEROMETER
@@ -557,70 +722,47 @@ static uint8_t readGEAR(uint16_t* rawValue)
 static bool readAcceleration()
 {
 #ifdef IMU_USE_LSM6DS3
-  // Read LSM6DS3 accelerometer data
-  // Normalized to milli-g (1000 = 1g)
+  // Read LSM6DS3 accelerometer and normalize to milli-g
+  // Seeed LSM6DS3 library provides readFloatAccelX/Y/Z() in g
+  // For ±2g range: sensitivity = 0.061 mg/LSB
   
-  myIMU.readAccelData();
+  float accelX = myIMU.readFloatAccelX();  // in g
+  float accelY = myIMU.readFloatAccelY();  // in g
+  float accelZ = myIMU.readFloatAccelZ();  // in g
   
-  // Get acceleration in g's (LSM6DS3 provides calibrated data)
-  // Range: ±2g = ±2000 milli-g
-  float accelX = myIMU.calcAccel(myIMU.accelX);  // in g
-  float accelY = myIMU.calcAccel(myIMU.accelY);  // in g
-  float accelZ = myIMU.calcAccel(myIMU.accelZ);  // in g
+  // Convert to milli-g
+  int16_t accel_x_mg = (int16_t)(accelX * 1000);
+  int16_t accel_y_mg = (int16_t)(accelY * 1000);
+  int16_t accel_z_mg = (int16_t)(accelZ * 1000);
   
-  // Convert from g to milli-g (multiply by 1000) for int16_t
-  currentAccel.x = (int16_t)(accelX * 1000);
-  currentAccel.y = (int16_t)(accelY * 1000);
-  currentAccel.z = (int16_t)(accelZ * 1000);
+  // Apply calibration offsets (subtract to remove bias)
+  int16_t off_x, off_y, off_z;
+  settings.getImuOffsets(off_x, off_y, off_z);
+  currentAccel.x = accel_x_mg - off_x;
+  currentAccel.y = accel_y_mg - off_y;
+  currentAccel.z = accel_z_mg - off_z;
   
   return true;
 #endif
 
 #ifdef IMU_USE_MPU6050_DMP
-  // DMP watchdog: reset if no valid packet for too long
-  uint32_t now = millis();
-  if (now - lastValidDMPPacket > IMU_DMP_WATCHDOG) {
-    Serial.println("#DMP watchdog: reinitializing FIFO");
-    mpu.resetFIFO();
-    lastValidDMPPacket = now;
-  }
-  
   // Read MPU6050 raw acceleration and normalize to milli-g
-  // MPU6050 raw acceleration scale: LSB/g depends on range
-  // At ±16g (default): 2048 LSB/g → raw_value / 2048 = acceleration in g
-  // Normalized: raw_value / 2.048 = acceleration in milli-g
+  // MPU6050 at ±8g: 4096 LSB/g → raw / 4.096 = milli-g
   
   int16_t ax, ay, az;
   mpu.getAcceleration(&ax, &ay, &az);
   
-  // Normalize MPU6050 raw values to milli-g
-  // At ±16g: LSB/g = 2048
-  // milli-g = raw * 1000 / 2048 ≈ raw * 0.488
-  // For consistency with LSM (±2g = ±2000 milli-g), scale appropriately:
-  // raw / 2048 (g) * 1000 = raw / 2.048 (milli-g)
-  currentAccel.x = (int16_t)(ax / 2.048f);
-  currentAccel.y = (int16_t)(ay / 2.048f);
-  currentAccel.z = (int16_t)(az / 2.048f);
+  // Normalize to milli-g
+  int16_t accel_x_mg = (int16_t)(ax / 4.096f);
+  int16_t accel_y_mg = (int16_t)(ay / 4.096f);
+  int16_t accel_z_mg = (int16_t)(az / 4.096f);
   
-  // Check for DMP data (optional: for future quaternion use)
-  mpuIntStatus = mpu.getIntStatus();
-  uint16_t fifoCount = mpu.getFIFOCount();
-  
-  if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
-    // FIFO overflow detected
-    Serial.println("FIFO overflow, resetting...");
-    mpu.resetFIFO();
-    return false;
-  } 
-  else if (mpuIntStatus & 0x02) {
-    // DMP data ready
-    while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
-    
-    mpu.getFIFOBytes(fifoBuffer, packetSize);
-    lastValidDMPPacket = now;  // Update watchdog timestamp
-    
-    return true;
-  }
+  // Apply calibration offsets (hardware offsets already applied at register level)
+  int16_t off_x, off_y, off_z;
+  settings.getImuOffsets(off_x, off_y, off_z);
+  currentAccel.x = accel_x_mg - off_x;
+  currentAccel.y = accel_y_mg - off_y;
+  currentAccel.z = accel_z_mg - off_z;
   
   return true;
 #endif
@@ -690,12 +832,16 @@ extern "C"
     {
       NRF_TIMER2->EVENTS_COMPARE[0] = 0;
 
-      _crankHead = _crankSize == 0 ? _crankHead : (++_crankHead) & (BUFFER_SIZE - 1);
+      if (_crankSize > 0) {
+        ++_crankHead;
+        _crankHead &= (RPM_TIMESTAMP_BUFFER_SIZE - 1);
+      }
       _crankMicros[_crankHead] = micros();
 
-      if (_crankSize == BUFFER_SIZE)
+      if (_crankSize == RPM_TIMESTAMP_BUFFER_SIZE)
       {
-        _crankTail = (++_crankTail) & (BUFFER_SIZE - 1);
+        _crankTail++;
+        _crankTail &= (RPM_TIMESTAMP_BUFFER_SIZE - 1);
       }
       else
       {
@@ -706,19 +852,23 @@ extern "C"
 
   void GPIOTE_IRQHandler(void)
   {
-#if ENABLE_SPEED_SENSOR
+#ifdef ENABLE_SPEED_SENSOR
     // Wheel ABS sensor interrupt handler (GPIOTE[4])
     
     if ((NRF_GPIOTE->EVENTS_IN[4] == 1) && (NRF_GPIOTE->INTENSET & (1 << 4)))
     {
       NRF_GPIOTE->EVENTS_IN[4] = 0;
       
-      _wheelHead = _wheelSize == 0 ? _wheelHead : (++_wheelHead) & (BUFFER_SIZE - 1);
+      if (_wheelSize > 0) {
+        ++_wheelHead;
+        _wheelHead &= (RPM_TIMESTAMP_BUFFER_SIZE - 1);
+      }
       _wheelMicros[_wheelHead] = micros();
 
-      if (_wheelSize == BUFFER_SIZE)
+      if (_wheelSize == RPM_TIMESTAMP_BUFFER_SIZE)
       {
-        _wheelTail = (++_wheelTail) & (BUFFER_SIZE - 1);
+        ++_wheelTail;
+        _wheelTail &= (RPM_TIMESTAMP_BUFFER_SIZE - 1);
       }
       else
       {
